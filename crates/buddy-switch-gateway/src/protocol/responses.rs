@@ -754,11 +754,13 @@ pub fn to_response_object_from(parts: &ResponsesParts<'_>, fallback_model: &str)
 
     let input_tokens = parts.input_tokens;
     let output_tokens = parts.output_tokens;
+    let end_turn = parts.tool_calls.is_empty();
     json!({
         "id": new_id("resp"),
         "object": "response",
         "created_at": created_at,
         "status": "completed",
+        "end_turn": end_turn,
         "model": model,
         "output": output,
         // 官方非流式对象带 `output_text` 便捷字段；流式末帧没有它（见 `finish` 的注解）。
@@ -802,6 +804,7 @@ pub struct ResponsesSseStream<S> {
     reasoning: String,
     tool_calls: Vec<ToolCallAccum>,
     usage: Option<Value>,
+    finish_reason: Option<String>,
     /// 声明为 custom（freeform）的工具名：这些调用要按 `custom_tool_call` 事件输出。
     custom: std::sync::Arc<HashSet<String>>,
     /// 扁平名 → (namespace, 原名)：事件里要补回 `namespace` 字段。
@@ -850,6 +853,7 @@ impl<S> ResponsesSseStream<S> {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             usage: None,
+            finish_reason: None,
             custom,
             namespaces,
             failover: None,
@@ -1073,6 +1077,22 @@ impl<S> ResponsesSseStream<S> {
         else {
             return;
         };
+
+        if let Some(reason) = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                choice
+                    .get("delta")
+                    .and_then(|delta| delta.get("finish_reason"))
+                    .and_then(Value::as_str)
+            })
+        {
+            if !reason.is_empty() {
+                self.finish_reason = Some(reason.to_string());
+            }
+        }
+
         let Some(delta) = choice.get("delta") else {
             return;
         };
@@ -1250,6 +1270,18 @@ impl<S> ResponsesSseStream<S> {
                 }),
             );
         }
+        let is_truncated = matches!(
+            self.finish_reason.as_deref(),
+            Some("length") | Some("max_tokens")
+        );
+        let end_turn = match self.finish_reason.as_deref() {
+            Some("length") | Some("max_tokens") => false,
+            Some("tool_calls") | Some("function_call") => false,
+            Some("stop") => self.tool_calls.is_empty(),
+            _ => self.tool_calls.is_empty(),
+        };
+        let msg_status = if is_truncated { "incomplete" } else { "completed" };
+
         if self.message_open {
             let id = self.message_id.clone();
             self.push_event(
@@ -1282,7 +1314,7 @@ impl<S> ResponsesSseStream<S> {
                     "item": {
                         "id": id,
                         "type": "message",
-                        "status": "completed",
+                        "status": msg_status,
                         "role": "assistant",
                         "content": [{"type": "output_text", "text": self.text, "annotations": []}],
                     },
@@ -1389,7 +1421,7 @@ impl<S> ResponsesSseStream<S> {
             output.push(json!({
                 "id": self.message_id,
                 "type": "message",
-                "status": "completed",
+                "status": msg_status,
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": self.text, "annotations": []}],
             }));
@@ -1428,13 +1460,20 @@ impl<S> ResponsesSseStream<S> {
             output.push(emitted);
         }
 
-        let mut response = self.response_skeleton("completed");
+        let mut response = self.response_skeleton(if is_truncated { "incomplete" } else { "completed" });
         if let Some(object) = response.as_object_mut() {
             object.insert("output".to_string(), Value::Array(output));
             object.insert(
                 "usage".to_string(),
                 build_responses_usage(self.usage.as_ref(), input_tokens, output_tokens),
             );
+            object.insert("end_turn".to_string(), json!(end_turn));
+            if is_truncated {
+                object.insert(
+                    "incomplete_details".to_string(),
+                    json!({"reason": "max_output_tokens"}),
+                );
+            }
         }
         self.push_event(
             "response.completed",
@@ -2159,5 +2198,93 @@ mod tests {
         assert_eq!(usage["output_tokens"], 10);
         assert_eq!(usage["input_tokens_details"]["cached_tokens"], 800);
         assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn finish_reason_length_marks_incomplete_and_end_turn_false() {
+        let payload = json!({
+            "choices": [{
+                "delta": {"content": "Truncated text..."},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 50}
+        });
+        let input = vec![chunk(&format!("data: {payload}
+
+"))];
+        let stream = ResponsesSseStream::new(
+            futures_util::stream::iter(input),
+            "deepseek-v4.1-flash".to_string(),
+            empty_custom(),
+        );
+        let events = collect_events(stream).await;
+        let completed = events.last().expect("must have response.completed");
+        assert_eq!(completed["type"], "response.completed");
+        let resp = &completed["response"];
+        assert_eq!(resp["status"], "incomplete");
+        assert_eq!(resp["end_turn"], false);
+        assert_eq!(resp["incomplete_details"]["reason"], "max_output_tokens");
+
+        // output_item.done for the message should also be marked incomplete
+        let msg_done = events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done" && e["item"]["type"] == "message")
+            .expect("must have message done");
+        assert_eq!(msg_done["item"]["status"], "incomplete");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_stop_marks_completed_and_end_turn_true() {
+        let payload = json!({
+            "choices": [{
+                "delta": {"content": "Complete response"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+        });
+        let input = vec![chunk(&format!("data: {payload}
+
+"))];
+        let stream = ResponsesSseStream::new(
+            futures_util::stream::iter(input),
+            "deepseek-v4.1-flash".to_string(),
+            empty_custom(),
+        );
+        let events = collect_events(stream).await;
+        let completed = events.last().expect("must have response.completed");
+        assert_eq!(completed["type"], "response.completed");
+        let resp = &completed["response"];
+        assert_eq!(resp["status"], "completed");
+        assert_eq!(resp["end_turn"], true);
+        assert!(resp.get("incomplete_details").is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_reason_tool_calls_marks_end_turn_false() {
+        let payload = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {"name": "get_time", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let input = vec![chunk(&format!("data: {payload}
+
+"))];
+        let stream = ResponsesSseStream::new(
+            futures_util::stream::iter(input),
+            "deepseek-v4.1-flash".to_string(),
+            empty_custom(),
+        );
+        let events = collect_events(stream).await;
+        let completed = events.last().expect("must have response.completed");
+        assert_eq!(completed["type"], "response.completed");
+        let resp = &completed["response"];
+        assert_eq!(resp["end_turn"], false);
     }
 }

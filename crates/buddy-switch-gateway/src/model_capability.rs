@@ -1,4 +1,3 @@
-
 //! 模型能力声明（**图片输入**）—— 出口 ① 与「管理面模型表」共用的**唯一解析点**。
 //!
 //! ## 为什么需要它（issue #101）
@@ -503,9 +502,9 @@ mod tests {
         // 用户显式覆盖为 false 时覆盖生效
         let mut store_override = ImageCaps::default();
         store_override.set(Scope::TraeCn, "deepseek-v4.1-flash", Some(false));
-        let cap_overridden = resolve(&store_override, Scope::TraeCn, "deepseek-v4.1-flash", None).unwrap();
+        let cap_overridden =
+            resolve(&store_override, Scope::TraeCn, "deepseek-v4.1-flash", None).unwrap();
         assert!(!cap_overridden.supports);
         assert_eq!(cap_overridden.source, ImageCapSource::Override);
     }
-
 }

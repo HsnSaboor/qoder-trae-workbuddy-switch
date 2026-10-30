@@ -32,13 +32,42 @@ fn content_to_text(content: &Value) -> String {
     }
 }
 
-/// tool_result 的 content 可能是字符串或 text block 数组。
-fn tool_result_to_text(content: Option<&Value>) -> String {
+
+
+/// 把 `tool_result.content` 拆成 (文本, 图片 URL 列表)。
+///
+/// ★ 图片**必须**单独拎出来走多模态 parts：`role:"tool"` 的 `content` 只能是字符串，
+/// 若把 `image` block 序列化进那个字符串，上游会按**字符**计费 —— 实测一张
+/// 200x200 噪声截图 = 114k tokens，而同一张图作为 `image_url` part 只要 ~2.7k。
+/// 这正是 `view_image` 必须被限流的原因，也是这里必须分开的理由。
+fn tool_result_parts(content: Option<&Value>) -> (String, Vec<String>) {
     match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(value @ Value::Array(_)) => content_to_text(value),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
-        None => String::new(),
+        Some(Value::Array(blocks)) => {
+            let mut text = String::new();
+            let mut images = Vec::new();
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("image") => {
+                        if let Some(url) = image_block_to_url(block) {
+                            images.push(url);
+                        }
+                    }
+                    Some("text") => {
+                        if let Some(part) = block.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(part);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (text, images)
+        }
+        Some(Value::String(text)) => (text.clone(), Vec::new()),
+        Some(other) => (serde_json::to_string(other).unwrap_or_default(), Vec::new()),
+        None => (String::new(), Vec::new()),
     }
 }
 
@@ -336,6 +365,8 @@ fn to_upstream_request_impl(body: &Value, allow_images: bool) -> Value {
                     // 关掉时**计数**而不是静默忽略：数量要写进文本，见
                     // [`images_dropped_note`]。
                     let mut images: Vec<String> = Vec::new();
+                    // 工具结果里带的图：`role:"tool"` 放不下，攒到这里，随后并进 user parts。
+                    let mut result_images_pending: Vec<String> = Vec::new();
                     let mut dropped_images = 0usize;
                     for block in blocks {
                         match block.get("type").and_then(Value::as_str) {
@@ -357,12 +388,32 @@ fn to_upstream_request_impl(body: &Value, allow_images: bool) -> Value {
                                     .get("tool_use_id")
                                     .cloned()
                                     .unwrap_or_else(|| json!(""));
-                                let content = tool_result_to_text(block.get("content"));
+                                // ★ 工具结果里的图片不能摊进文本（见 `tool_result_parts`）。
+                                let (mut content, result_images) =
+                                    tool_result_parts(block.get("content"));
+                                if !result_images.is_empty() {
+                                    // 文本里留一个可读的占位，真正的图在后面的 user 消息。
+                                    if !content.is_empty() {
+                                        content.push('\n');
+                                    }
+                                    content.push_str(&format!(
+                                        "[{} image(s) from tool result follow]",
+                                        result_images.len()
+                                    ));
+                                }
                                 tool_results.push(json!({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
                                     "content": content,
                                 }));
+                                // `role:"tool"` 不能带多模态 parts ⇒ 图片排进本轮 user 消息。
+                                for url in result_images {
+                                    if allow_images {
+                                        result_images_pending.push(url);
+                                    } else {
+                                        dropped_images += 1;
+                                    }
+                                }
                             }
                             Some("image") if allow_images => {
                                 if let Some(url) = image_block_to_url(block) {
@@ -399,10 +450,16 @@ fn to_upstream_request_impl(body: &Value, allow_images: bool) -> Value {
                         messages.extend(tool_results);
                         // ★ 带图 ⇒ content 用多模态 parts 数组（上游只读 content
                         // 里的结构化 `image_url` parts）。
+                        images.extend(result_images_pending.drain(..));
                         if !images.is_empty() {
                             let mut parts: Vec<Value> = Vec::new();
                             if !text.is_empty() {
                                 parts.push(json!({"type": "text", "text": text}));
+                            } else {
+                                parts.push(json!({
+                                    "type": "text",
+                                    "text": "[image from tool result]"
+                                }));
                             }
                             for url in images {
                                 parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
