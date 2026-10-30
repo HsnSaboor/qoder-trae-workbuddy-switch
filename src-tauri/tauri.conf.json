@@ -48,11 +48,11 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzNTE1NDY4Q0RBNDE2QTQKUldTa0ZxVE5hRlJSZzUvTVlOWlF5UklxTVE3MXkvL1E3OVZTRHNQVzdkZ0k2MHcwWkVXdjdzVFAK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJERkYwRkMwM0E3MDk5RTIKUldUaW1YQTZ3QS8vdmJJRmNnYXQwMXkyR21kSUdnc08yZG90K3BDZUtyTGdxb284NEx2VWpUWmMK",
       "endpoints": [
-        "https://github.com/NextAgentX/qoder-trae-workbuddy-switch/releases/latest/download/latest.json",
-        "https://github.com/NextAgentX/qoder-trae-workbuddy-switch/releases/latest/download/latest-{{target}}-{{arch}}.json",
-        "https://github.com/NextAgentX/qoder-trae-workbuddy-switch/releases/latest/download/latest-macos-{{arch}}.json"
+        "https://github.com/HsnSaboor/qoder-trae-workbuddy-switch/releases/latest/download/latest.json",
+        "https://github.com/HsnSaboor/qoder-trae-workbuddy-switch/releases/latest/download/latest-{{target}}-{{arch}}.json",
+        "https://github.com/HsnSaboor/qoder-trae-workbuddy-switch/releases/latest/download/latest-macos-{{arch}}.json"
       ]
     }
   }

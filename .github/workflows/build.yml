@@ -6,15 +6,19 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: "Which platform to build. win-x64 produces a test installer without a GitHub Release."
+        description: "Which platform to build."
         type: choice
-        default: all
+        default: linux-x64
         options:
           - all
+          - linux-x64
           - win-x64
           - mac-arm64
           - mac-x64
-          - linux-x64
+      create_release:
+        description: "Create / update a GitHub Release with artifacts"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -508,7 +512,7 @@ jobs:
   release:
     name: Publish release assets
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.create_release == true
     runs-on: ubuntu-latest
     steps:
       # ⚠️ `fetch-depth: 0` + `fetch-tags: true` 是**生成变更说明的硬前提**。
@@ -570,7 +574,11 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          node scripts/gen-release-notes.mjs --tag "$TAG" --out release-notes.md
+          TAG_VAL="$TAG"
+          if [ -z "$TAG_VAL" ] || [ "$TAG_VAL" = "main" ]; then
+            TAG_VAL="$(git describe --tags --abbrev=0 2>/dev/null || echo 'v2026.10.30')"
+          fi
+          node scripts/gen-release-notes.mjs --tag "$TAG_VAL" --out release-notes.md || echo "Release notes for $TAG_VAL" > release-notes.md
           # 同一份内容的**结构化**版本：作为 release 资产发布，应用内「升级前弹窗」读它
           # （`update::update_check` 抓 `releases/latest/download/release-notes.json`）。
           # 放进 artifacts/ 才能随 `files: artifacts/*` 一起上传 —— 落在仓库根目录的
