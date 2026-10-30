@@ -88,7 +88,7 @@ jobs:
                   "target": "x86_64-unknown-linux-gnu",
                   "cli_bin": "buddy-switch-linux-x64",
                   "platform_tag": "linux-x64",
-                  "bundles": "deb,appimage",
+                  "bundles": "appimage",
                   "update_os": "linux",
                   "update_arch": "x86_64",
                   "update_bundle": "appimage",
@@ -245,7 +245,7 @@ jobs:
           # 打包内置的「本版说明」（离线兜底，`src/data/release-notes.json`）必须跟着版本走：
           # 它由 `docs/releases/<版本>.md` 或提交分组推导，**不重生成就是上一版的内容**
           # （门禁 `check:scope` 会比对版本号，不重生成直接红）。
-          node scripts/gen-release-notes.mjs --json src/data/release-notes.json
+          npm run notes:json
 
       # `tauri.conf.json` 的 `createUpdaterArtifacts: true` 使签名私钥成为**打包硬依赖**：
       # 少了它，`tauri build` 会先跑完 ~5 分钟的 Rust 编译，最后才抛一句难定位的错。
