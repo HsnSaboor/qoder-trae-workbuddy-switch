@@ -20,7 +20,7 @@
 //!
 //! 流内失败也写回冷却，是为了让**下一轮**请求自动避开这个账号——否则每次都要先撞墙。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
@@ -434,7 +434,8 @@ pub async fn chat_for_variant(
                 started,
                 hop_variant,
                 key.as_deref(),
-                // chat 入口没有 custom 工具概念。
+                // chat 入口没有 custom 工具 / namespace 概念。
+                None,
                 None,
             )
             .await
@@ -656,7 +657,8 @@ pub async fn messages_for_variant(
                 started,
                 hop_variant,
                 key.as_deref(),
-                // Anthropic 入口没有 custom 工具概念。
+                // Anthropic 入口没有 custom 工具 / namespace 概念。
+                None,
                 None,
             )
             .await
@@ -790,6 +792,14 @@ pub async fn responses_for_variant(
     `custom_tool_call` 事件/条目。 */
     let responses_custom =
         std::sync::Arc::new(crate::protocol::responses::custom_tool_names(&parsed));
+    let responses_namespaces =
+        std::sync::Arc::new(crate::protocol::responses::flatten_namespace_tools(&parsed).0);
+    let responses_custom = {
+        let mut merged = (*responses_custom).clone();
+        merged.extend(responses_namespaces.custom.iter().cloned());
+        std::sync::Arc::new(merged)
+    };
+    let responses_namespace_map = std::sync::Arc::new(responses_namespaces.namespaces.clone());
 
     // Responses 请求 → 上游 chat 形态。
     let upstream = crate::protocol::responses::to_upstream_request(&parsed);
@@ -901,6 +911,7 @@ pub async fn responses_for_variant(
                 hop_variant,
                 key.as_deref(),
                 Some(responses_custom.clone()),
+                Some(responses_namespace_map.clone()),
             )
             .await
         } else {
@@ -928,10 +939,11 @@ pub async fn responses_for_variant(
                         crate::protocol::openai::CompletionAccumulator::from_response(&payload);
                     json_response(
                         StatusCode::OK,
-                        crate::protocol::responses::to_response_object(
+                        crate::protocol::responses::to_response_object_with_namespaces(
                             &accumulator,
                             &hop_model,
                             responses_custom.as_ref(),
+                            &responses_namespace_map,
                         ),
                     )
                 }
@@ -999,6 +1011,7 @@ async fn stream_chat(
     // chat / messages 传 `None`（它们没有这个概念）。由**原始**请求体取，
     // 转换后 `type` 已被降级成 function，拿不回来。
     responses_custom: Option<std::sync::Arc<HashSet<String>>>,
+    responses_namespaces: Option<std::sync::Arc<HashMap<String, (String, String)>>>,
 ) -> Response {
     // ★ issue #76：允许名单整轮算一次，选号与失败兜底共用（理由见 `attempt_once`）。
     let allowed = key.and_then(|actor| allowed_uids_for(&actor.policy, variant));
@@ -1079,7 +1092,12 @@ async fn stream_chat(
                     anthropic_sse_response(rx, model, estimated)
                 } else if is_responses_endpoint(endpoint) {
                     // Responses 事件流：内层是同一条 OpenAI SSE，逐事件重编。
-                    responses_sse_response(rx, model, responses_custom.clone())
+                    responses_sse_response(
+                        rx,
+                        model,
+                        responses_custom.clone(),
+                        responses_namespaces.clone(),
+                    )
                 } else {
                     sse_response(rx)
                 };
@@ -1911,6 +1929,7 @@ fn responses_sse_response(
     rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
     model: &str,
     custom: Option<std::sync::Arc<HashSet<String>>>,
+    namespaces: Option<std::sync::Arc<HashMap<String, (String, String)>>>,
 ) -> Response {
     let inner = Box::pin(sse::stream_from_receiver(rx));
     Response::builder()
@@ -1919,10 +1938,11 @@ fn responses_sse_response(
         .header(header::CACHE_CONTROL, "no-cache")
         .header("X-Accel-Buffering", "no")
         .body(Body::from_stream(
-            crate::protocol::responses::ResponsesSseStream::new(
+            crate::protocol::responses::ResponsesSseStream::with_namespaces(
                 inner,
                 model.to_string(),
                 custom.unwrap_or_default(),
+                namespaces.unwrap_or_default(),
             ),
         ))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())

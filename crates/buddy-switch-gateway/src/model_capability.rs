@@ -1,3 +1,4 @@
+
 //! 模型能力声明（**图片输入**）—— 出口 ① 与「管理面模型表」共用的**唯一解析点**。
 //!
 //! ## 为什么需要它（issue #101）
@@ -234,6 +235,20 @@ pub fn resolve_effective(
             source: ImageCapSource::Override,
         });
     }
+    if let Some(supports) = upstream {
+        if supports {
+            return Some(ImageCapability {
+                supports: true,
+                source: ImageCapSource::Upstream,
+            });
+        }
+    }
+    if is_known_multimodal(model_id) {
+        return Some(ImageCapability {
+            supports: true,
+            source: ImageCapSource::Upstream,
+        });
+    }
     upstream.map(|supports| ImageCapability {
         supports,
         source: ImageCapSource::Upstream,
@@ -262,6 +277,15 @@ pub fn set_and_save(scope: Scope, model_id: &str, supports: Option<bool>) -> Res
 /// **唯一解析点**：上游声明 > 用户覆盖；两边都没有 ⇒ `None`（不下发字段）。
 ///
 /// `upstream`：WB 目录给的 `supports_images`；Trae / Qoder 传 `None`。
+/// 判断是否为已知具备多模态输入（文本+图片）能力的基础模型（如 deepseek-v4.1-flash）。
+pub fn is_known_multimodal(model_id: &str) -> bool {
+    let lower = model_id.to_ascii_lowercase();
+    let id_part = lower.rsplit(":").next().unwrap_or(&lower);
+    id_part.contains("deepseek-v4.1-flash")
+        || id_part.contains("deepseek-v4-flash")
+        || id_part == "dfmodel"
+}
+
 pub fn resolve(
     store: &ImageCaps,
     scope: Scope,
@@ -272,6 +296,20 @@ pub fn resolve(
         return Some(ImageCapability {
             supports,
             source: ImageCapSource::Override,
+        });
+    }
+    if let Some(supports) = upstream {
+        if supports {
+            return Some(ImageCapability {
+                supports: true,
+                source: ImageCapSource::Upstream,
+            });
+        }
+    }
+    if is_known_multimodal(model_id) {
+        return Some(ImageCapability {
+            supports: true,
+            source: ImageCapSource::Upstream,
         });
     }
     upstream.map(|supports| ImageCapability {
@@ -451,4 +489,23 @@ mod tests {
         // 空白 id 一律拒绝（不写脏数据）
         assert!(!store.set(Scope::WbCn, "  ", Some(true)));
     }
+    #[test]
+    fn deepseek_v4_1_flash_defaults_to_multimodal() {
+        let store = ImageCaps::default();
+        // Trae / Qoder 上游未声明时
+        let cap = resolve(&store, Scope::TraeCn, "deepseek-v4.1-flash", None).unwrap();
+        assert!(cap.supports);
+        assert_eq!(cap.source, ImageCapSource::Upstream);
+
+        let cap_qoder = resolve(&store, Scope::QoderGlobal, "dfmodel", None).unwrap();
+        assert!(cap_qoder.supports);
+
+        // 用户显式覆盖为 false 时覆盖生效
+        let mut store_override = ImageCaps::default();
+        store_override.set(Scope::TraeCn, "deepseek-v4.1-flash", Some(false));
+        let cap_overridden = resolve(&store_override, Scope::TraeCn, "deepseek-v4.1-flash", None).unwrap();
+        assert!(!cap_overridden.supports);
+        assert_eq!(cap_overridden.source, ImageCapSource::Override);
+    }
+
 }

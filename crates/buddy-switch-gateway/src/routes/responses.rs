@@ -17,7 +17,7 @@ use buddy_switch_core::modules::region::Region;
 use crate::logging::RequestMeta;
 use crate::outbound::PromptMode;
 use crate::protocol::openai::CompletionAccumulator;
-use crate::protocol::responses::{to_response_object, to_upstream_request, ResponsesSseStream};
+use crate::protocol::responses::{to_upstream_request, ResponsesSseStream};
 use crate::routes::relay::{self, RelayKind, RelayOutcome, RelayRequest};
 use crate::routes::{
     authenticate, json_response, openai_error, openai_error_with_fallback, parse_body, sse_response,
@@ -126,6 +126,16 @@ pub async fn responses_for_region(
     /* freeform（custom）工具名：从**原始**请求体取（转换后已降级成 function，`type` 丢了）。 */
     let responses_custom =
         std::sync::Arc::new(crate::protocol::responses::custom_tool_names(&parsed));
+    /* namespace 分组的还原表：扁平名 → (namespace, 原名)。同样从原始请求体取。 */
+    let responses_namespaces =
+        std::sync::Arc::new(crate::protocol::responses::flatten_namespace_tools(&parsed).0);
+    // `custom` 也要覆盖 namespace 里声明成 custom 的嵌套工具（摊平后名字变了）。
+    let responses_custom = {
+        let mut merged = (*responses_custom).clone();
+        merged.extend(responses_namespaces.custom.iter().cloned());
+        std::sync::Arc::new(merged)
+    };
+    let responses_namespace_map = std::sync::Arc::new(responses_namespaces.namespaces.clone());
 
     // Responses 请求 → 上游（chat.completions 形态）。
     let upstream_body = to_upstream_request(&parsed);
@@ -303,7 +313,7 @@ pub async fn responses_for_region(
                     Some(failure.clone()),
                 );
                 sse_response(
-                    ResponsesSseStream::new(
+                    ResponsesSseStream::with_namespaces(
                         crate::protocol::usage_tap::UsageTap::new(
                             relay::prefix_stream(prefix, response),
                             sinks,
@@ -319,6 +329,7 @@ pub async fn responses_for_region(
                         .with_failure(Some(failure.clone())),
                         model.clone(),
                         responses_custom,
+                        responses_namespace_map,
                     )
                     // ★ issue #129：开关开启时，收尾发 `error` 事件而不是 `response.completed`。
                     .with_failover(Some(failure), &account),
@@ -371,7 +382,12 @@ pub async fn responses_for_region(
                     relay::record_ledger(&state, &uid, &model, credit, tokens, key.as_deref())
                         .await;
                 }
-                let object = to_response_object(&accumulator, &model, &responses_custom);
+                let object = crate::protocol::responses::to_response_object_with_namespaces(
+                    &accumulator,
+                    &model,
+                    &responses_custom,
+                    &responses_namespace_map,
+                );
                 state.log.record(
                     RequestMeta {
                         endpoint: "/v1/responses",

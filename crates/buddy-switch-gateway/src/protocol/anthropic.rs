@@ -212,23 +212,17 @@ pub fn to_upstream_request_with_images(body: &Value) -> Value {
 
 /// 是否让 Anthropic 入口（`/v1/messages`）把 `image` block 转发给上游。
 ///
-/// 默认**关**。理由：WB / Trae 上游接受不接受 `content` 里的结构化
-/// `image_url` parts **尚未实测**，贸然打开只是把「静默丢图」换成「上游 400」，
-/// 并没有变好。实测路径很短 —— 起网关、用 `curl` 发一条带 `data:` URI 的
-/// 图片 part、问模型图里是什么，答对即通过。
-///
-/// 打开：`BUDDY_SWITCH_ANTHROPIC_FORWARD_IMAGES=1`（`on` / `true` / `yes` 同效）。
-/// 与 `BUDDY_SWITCH_QODER_KEEP_TOPLEVEL_IMAGES` 同形（同一套布尔解析）。
+/// 默认**开**。若需显式关闭可置 `BUDDY_SWITCH_ANTHROPIC_FORWARD_IMAGES=0`（`off` / `false` / `no` 同效）。
 pub fn forward_images_enabled() -> bool {
     std::env::var("BUDDY_SWITCH_ANTHROPIC_FORWARD_IMAGES")
         .ok()
         .map(|raw| {
-            matches!(
+            !matches!(
                 raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "on" | "true" | "yes"
+                "0" | "off" | "false" | "no"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// 按开关选择是否带图（`/v1/messages` 两条产品线共用）。
@@ -1147,6 +1141,27 @@ mod tests {
     }
 
     /// ★ 带图入口把 `image` block 转成 OpenAI 多模态 `image_url` part。
+    #[test]
+    fn to_upstream_request_adaptive_preserves_images_by_default() {
+        let body = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "这是什么"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}},
+                ],
+            }],
+        });
+        let out = to_upstream_request_adaptive(&body);
+        let messages = out["messages"].as_array().unwrap();
+        let content = messages[0]["content"]
+            .as_array()
+            .expect("默认带图 ⇒ parts 数组");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+    }
+
     #[test]
     fn to_upstream_request_with_images_keeps_multimodal_parts() {
         let body = json!({

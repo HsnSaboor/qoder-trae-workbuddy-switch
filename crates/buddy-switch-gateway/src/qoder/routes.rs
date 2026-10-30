@@ -14,7 +14,7 @@
 //! 出站改写 / 停用判定 / 选号换号 / 冷却 / 粘性 / 日志不能有第二份，否则漂移点
 //! 恰恰是「换号 + 流内失败」这类最难复现的行为。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use axum::body::Bytes;
@@ -536,6 +536,16 @@ pub async fn chat_for_region_once(
     之后它们已被降级成普通 function，名字还在，但 `type` 已经没了。 */
     let responses_custom =
         std::sync::Arc::new(crate::protocol::responses::custom_tool_names(&parsed));
+    /* namespace 分组的还原表（扁平名 → (namespace, 原名)）。 */
+    let responses_namespaces = {
+        let names = crate::protocol::responses::flatten_namespace_tools(&parsed).0;
+        let mut merged = (*responses_custom).clone();
+        merged.extend(names.custom.iter().cloned());
+        (
+            std::sync::Arc::new(merged),
+            std::sync::Arc::new(names.namespaces),
+        )
+    };
     let sticky_key = payload::sticky_key_of(&parsed);
     let preferred = {
         let configured = config.preferred_uid.trim();
@@ -713,6 +723,7 @@ pub async fn chat_for_region_once(
                         started,
                         allowed_tools,
                         responses_custom.clone(),
+                        responses_namespaces.1.clone(),
                         inflight,
                         key.clone(),
                         // ★ issue #129：首帧后失败也要解绑粘性（否则重跑仍撞同一个号）。
@@ -738,6 +749,7 @@ pub async fn chat_for_region_once(
                         started,
                         allowed_tools,
                         responses_custom.clone(),
+                        responses_namespaces.1.clone(),
                         inflight,
                         key.clone(),
                     )
@@ -995,6 +1007,7 @@ async fn stream_relay(
     started: Instant,
     allowed_tools: Option<HashSet<String>>,
     responses_custom: std::sync::Arc<HashSet<String>>,
+    responses_namespaces: std::sync::Arc<HashMap<String, (String, String)>>,
     // 在途名额：随流结束 / 客户端断开由 Drop 归还（见 `pool::InflightGuard`）。
     inflight: super::pool::InflightGuard,
     // ★ issue #76：本密钥（流结束时按 token 记账）。
@@ -1056,11 +1069,14 @@ async fn stream_relay(
         ),
         // Responses 事件流：`response.created` … `response.completed`（**不补 `[DONE]`**，
         // 上游那一条会被本层吞掉 —— 见 `protocol::responses::ResponsesSseStream`）。
-        Protocol::Responses => Box::pin(crate::protocol::responses::ResponsesSseStream::new(
-            tapped,
-            stream_model.clone(),
-            responses_custom,
-        )),
+        Protocol::Responses => Box::pin(
+            crate::protocol::responses::ResponsesSseStream::with_namespaces(
+                tapped,
+                stream_model.clone(),
+                responses_custom,
+                responses_namespaces,
+            ),
+        ),
     };
 
     tokio::spawn(async move {
@@ -1162,6 +1178,7 @@ async fn aggregate_relay(
     started: Instant,
     allowed_tools: Option<HashSet<String>>,
     responses_custom: std::sync::Arc<HashSet<String>>,
+    responses_namespaces: std::sync::Arc<HashMap<String, (String, String)>>,
     // 非流式：函数结束即释放（含所有早退分支）。
     _inflight: super::pool::InflightGuard,
     // ★ issue #76：本密钥（聚合完成后按 token 记账）。
@@ -1246,6 +1263,7 @@ async fn aggregate_relay(
                 input_tokens: prompt_tokens,
                 output_tokens: completion_tokens,
                 custom: &responses_custom,
+                namespaces: &responses_namespaces,
                 raw_usage: usage.as_ref(),
             },
             model,

@@ -26,7 +26,7 @@
 //! `stream_options.include_usage`，因此本模块的出站路径统一按 SSE 处理：
 //! 客户端要流式就转事件流，不要流式就聚合成对象。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -70,6 +70,111 @@ pub fn custom_tool_names(body: &Value) -> HashSet<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 一次请求里**非默认**工具形状的全部信息：出站降级与入站还原共用这一份。
+///
+/// 上游（chat.completions）只有扁平的 `function` 工具，而 Codex 等客户端会发两种
+/// 上游不认识的形状：
+/// - `{"type":"custom","name":"apply_patch"}` —— freeform，要降级成单 `input` 参数；
+/// - `{"type":"namespace","name":"mcp__search","tools":[…]}` —— 工具**分组**，要摊平。
+///
+/// 两种都必须「摊平后还记得怎么还原」，否则调用回来时对不上名字 ⇒ 客户端报
+/// `unsupported call`，模型以为工具不存在。
+#[derive(Debug, Default, Clone)]
+pub struct ToolNames {
+    /// 扁平名集合：这些工具是 freeform，调用要还原成 `custom_tool_call`。
+    pub custom: HashSet<String>,
+    /// 扁平名 → (namespace, 原名)。命中的调用要补回 `namespace` 字段。
+    pub namespaces: HashMap<String, (String, String)>,
+}
+
+impl ToolNames {
+    /// 该扁平名属于哪个 namespace（用于出站还原）。
+    pub fn namespace_of(&self, flat: &str) -> Option<&(String, String)> {
+        self.namespaces.get(flat)
+    }
+}
+
+/// 把 `namespace` 里的一个嵌套工具名摊平成**全局唯一**的 chat 工具名。
+///
+/// 与 Codex 自己的 `code_mode_name_for_tool_name` 保持同一套规则：
+/// namespace 以 `_` 结尾、或工具名以 `_` 开头时直接拼接，否则用 `__` 分隔。
+/// 规则一致才能让模型在 `exec` 里写的名字与顶层工具名对得上。
+pub fn flatten_tool_name(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        return name.to_string();
+    }
+    if namespace.ends_with('_') || name.starts_with('_') {
+        format!("{namespace}{name}")
+    } else {
+        format!("{namespace}__{name}")
+    }
+}
+
+/// 收集请求体里所有 `type:"namespace"` 分组，摊平后返回 (ToolNames, 摊平后的工具声明)。
+///
+/// 返回的声明已是可以直接塞进 chat `tools[]` 的 `{type:"function",…}`。
+pub fn flatten_namespace_tools(body: &Value) -> (ToolNames, Vec<Value>) {
+    let mut names = ToolNames::default();
+    let mut flattened: Vec<Value> = Vec::new();
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return (names, flattened);
+    };
+    for group in tools {
+        if group.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let namespace = group
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if namespace.is_empty() {
+            continue;
+        }
+        let Some(nested) = group.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for tool in nested {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let flat = flatten_tool_name(&namespace, name);
+            names
+                .namespaces
+                .insert(flat.clone(), (namespace.clone(), name.to_string()));
+            if is_custom_tool(tool) {
+                names.custom.insert(flat.clone());
+                if let Some(mut downgraded) = downgrade_custom_tool(tool) {
+                    if let Some(obj) = downgraded.as_object_mut() {
+                        obj.insert("name".to_string(), json!(flat));
+                    }
+                    flattened.push(downgraded);
+                }
+                continue;
+            }
+            let description = tool
+                .get("description")
+                .cloned()
+                .unwrap_or_else(|| json!(""));
+            let parameters = tool
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            flattened.push(json!({
+                "type": "function",
+                "function": {
+                    "name": flat,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            }));
+        }
+    }
+    (names, flattened)
 }
 
 /// 把 `custom` 工具降级成「单 `input` 字符串参数」的 function 工具。
@@ -172,8 +277,13 @@ pub fn to_upstream_request(body: &Value) -> Value {
     out.insert("messages".to_string(), Value::Array(messages));
 
     // tools：Responses 的**扁平** schema → chat 的 `function` 包装。
+    //
+    // ★ `type:"namespace"` 分组**必须摊平**，不能落到下面的 `_ => None`：
+    //   那一条会把它整组静默丢掉，Codex 的 MCP 工具（`mcp__search` 等）就此消失，
+    //   模型被告知「没有这个工具」，而服务端日志里一切正常。
+    let mut converted: Vec<Value> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let converted: Vec<Value> = tools
+        converted = tools
             .iter()
             .filter_map(|tool| {
                 match tool.get("type").and_then(Value::as_str) {
@@ -204,13 +314,17 @@ pub fn to_upstream_request(body: &Value) -> Value {
                     // 不降级的后果是「工具被静默丢弃」——Codex 的 apply_patch 就永远调不到。
                     Some("custom") => downgrade_custom_tool(tool),
                     // 内置工具（web_search / file_search / computer_use …）上游不支持 ⇒ 跳过。
+                    // `namespace` 由下面的 `flatten_namespace_tools` 单独处理。
                     _ => None,
                 }
             })
             .collect();
-        if !converted.is_empty() {
-            out.insert("tools".to_string(), Value::Array(converted));
-        }
+    }
+    // 摊平 `type:"namespace"` 分组（Codex 的 MCP 工具就是这么发出来的）。
+    let (_, flattened) = flatten_namespace_tools(body);
+    converted.extend(flattened);
+    if !converted.is_empty() {
+        out.insert("tools".to_string(), Value::Array(converted));
     }
 
     if let Some(choice) = body.get("tool_choice") {
@@ -412,6 +526,9 @@ pub struct ResponsesParts<'a> {
     /// 本次请求里声明为 **custom（freeform）** 的工具名 —— 命中的调用要还原成
     /// `custom_tool_call`，而不是 `function_call`。
     pub custom: &'a HashSet<String>,
+    /// 扁平名 → (namespace, 原名)：命中的调用要补回 `namespace` 字段，否则
+    /// Codex 按默认 `functions` 命名空间查工具 ⇒ `unsupported call`。
+    pub namespaces: &'a HashMap<String, (String, String)>,
     /// 上游原始 usage 统计，用于提取缓存命中及思考细节。
     pub raw_usage: Option<&'a Value>,
 }
@@ -421,6 +538,16 @@ pub fn to_response_object(
     accumulator: &CompletionAccumulator,
     fallback_model: &str,
     custom: &HashSet<String>,
+) -> Value {
+    to_response_object_with_namespaces(accumulator, fallback_model, custom, &HashMap::new())
+}
+
+/// 同 [`to_response_object`]，但会为 namespace 里的调用补回 `namespace` 字段。
+pub fn to_response_object_with_namespaces(
+    accumulator: &CompletionAccumulator,
+    fallback_model: &str,
+    custom: &HashSet<String>,
+    namespaces: &HashMap<String, (String, String)>,
 ) -> Value {
     let tool_calls: Vec<Value> = accumulator
         .tool_calls
@@ -443,6 +570,7 @@ pub fn to_response_object(
             input_tokens: accumulator.prompt_tokens.unwrap_or(0),
             output_tokens: accumulator.completion_tokens.unwrap_or(0),
             custom,
+            namespaces,
             raw_usage: accumulator.raw_usage.as_ref(),
         },
         fallback_model,
@@ -589,26 +717,39 @@ pub fn to_response_object_from(parts: &ResponsesParts<'_>, fallback_model: &str)
             .and_then(|function| function.get("arguments"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // namespace 分组里的工具：补回 `namespace` + 原名，Codex 才能路由。
+        let (ns, plain_name) = match parts.namespaces.get(name) {
+            Some((namespace, plain)) => (Some(namespace.clone()), plain.as_str()),
+            None => (None, name),
+        };
         if parts.custom.contains(name) {
             // freeform 调用：把 `{"input": …}` 拆回原始 payload。
-            output.push(json!({
+            let mut item = json!({
                 "id": new_id("fc"),
                 "type": "custom_tool_call",
                 "status": "completed",
                 "call_id": call_id,
-                "name": name,
+                "name": plain_name,
                 "input": unwrap_custom_input(arguments),
-            }));
+            });
+            if let Some(namespace) = ns {
+                item["namespace"] = json!(namespace);
+            }
+            output.push(item);
             continue;
         }
-        output.push(json!({
+        let mut item = json!({
             "id": new_id("fc"),
             "type": "function_call",
             "status": "completed",
             "call_id": call_id,
-            "name": name,
+            "name": plain_name,
             "arguments": arguments,
-        }));
+        });
+        if let Some(namespace) = ns {
+            item["namespace"] = json!(namespace);
+        }
+        output.push(item);
     }
 
     let input_tokens = parts.input_tokens;
@@ -663,6 +804,8 @@ pub struct ResponsesSseStream<S> {
     usage: Option<Value>,
     /// 声明为 custom（freeform）的工具名：这些调用要按 `custom_tool_call` 事件输出。
     custom: std::sync::Arc<HashSet<String>>,
+    /// 扁平名 → (namespace, 原名)：事件里要补回 `namespace` 字段。
+    namespaces: std::sync::Arc<HashMap<String, (String, String)>>,
     /// ★ issue #129：账号故障自动切换的失败信号（`None` = 开关关闭 / 未接入）。
     failover: Option<ResponsesFailover>,
 }
@@ -678,6 +821,16 @@ impl<S> ResponsesSseStream<S> {
     /// `custom` 来自**原始** Responses 请求体（[`custom_tool_names`]），
     /// 与出站降级共用同一份集合 ⇒ 声明了 custom 的调用一定会被还原成 custom 事件。
     pub fn new(inner: S, model: String, custom: std::sync::Arc<HashSet<String>>) -> Self {
+        Self::with_namespaces(inner, model, custom, std::sync::Arc::new(HashMap::new()))
+    }
+
+    /// 同 [`Self::new`]，但会为 namespace 里的调用补回 `namespace` 字段。
+    pub fn with_namespaces(
+        inner: S,
+        model: String,
+        custom: std::sync::Arc<HashSet<String>>,
+        namespaces: std::sync::Arc<HashMap<String, (String, String)>>,
+    ) -> Self {
         Self {
             inner: Box::pin(inner),
             buffer: Vec::new(),
@@ -698,6 +851,7 @@ impl<S> ResponsesSseStream<S> {
             tool_calls: Vec::new(),
             usage: None,
             custom,
+            namespaces,
             failover: None,
         }
     }
@@ -838,14 +992,19 @@ impl<S> ResponsesSseStream<S> {
         let name = item.name.clone();
         let custom = self.custom.contains(&name);
         let output_index = 2 + index;
-        let item = if custom {
+        // namespace 分组里的工具：补回 `namespace` + 原名，Codex 才能路由。
+        let (ns, plain_name) = match self.namespaces.get(&name) {
+            Some((namespace, plain)) => (Some(namespace.clone()), plain.clone()),
+            None => (None, name.clone()),
+        };
+        let mut item = if custom {
             // freeform 工具：官方事件的 item 形状是 `custom_tool_call` + `input`。
             json!({
                 "id": item_id,
                 "type": "custom_tool_call",
                 "status": "in_progress",
                 "call_id": item.id,
-                "name": name,
+                "name": plain_name,
                 "input": "",
             })
         } else {
@@ -854,10 +1013,13 @@ impl<S> ResponsesSseStream<S> {
                 "type": "function_call",
                 "status": "in_progress",
                 "call_id": item.id,
-                "name": name,
+                "name": plain_name,
                 "arguments": "",
             })
         };
+        if let Some(namespace) = ns {
+            item["namespace"] = json!(namespace);
+        }
         self.push_event(
             "response.output_item.added",
             json!({
@@ -1165,13 +1327,18 @@ impl<S> ResponsesSseStream<S> {
             let item_id = self.tool_calls[index].id.clone();
             let name = self.tool_calls[index].name.clone();
             let arguments = self.tool_calls[index].arguments.clone();
-            let done_item = if custom {
+            // namespace 分组里的工具：done 事件也要补回 `namespace` + 原名。
+            let (ns, plain_name) = match self.namespaces.get(&name) {
+                Some((namespace, plain)) => (Some(namespace.clone()), plain.clone()),
+                None => (None, name.clone()),
+            };
+            let mut done_item = if custom {
                 json!({
                     "id": item_id,
                     "type": "custom_tool_call",
                     "status": "completed",
                     "call_id": self.tool_calls[index].id,
-                    "name": name,
+                    "name": plain_name,
                     "input": unwrap_custom_input(&arguments),
                 })
             } else {
@@ -1180,10 +1347,13 @@ impl<S> ResponsesSseStream<S> {
                     "type": "function_call",
                     "status": "completed",
                     "call_id": self.tool_calls[index].id,
-                    "name": name,
+                    "name": plain_name,
                     "arguments": arguments,
                 })
             };
+            if let Some(namespace) = ns {
+                done_item["namespace"] = json!(namespace);
+            }
             self.push_event(
                 "response.output_item.done",
                 json!({
@@ -1229,25 +1399,33 @@ impl<S> ResponsesSseStream<S> {
                 continue;
             }
             let item = &self.tool_calls[index];
-            if self.custom.contains(&item.name) {
-                output.push(json!({
+            let (ns, plain_name) = match self.namespaces.get(&item.name) {
+                Some((namespace, plain)) => (Some(namespace.clone()), plain.clone()),
+                None => (None, item.name.clone()),
+            };
+            let mut emitted = if self.custom.contains(&item.name) {
+                json!({
                     "id": item.id,
                     "type": "custom_tool_call",
                     "status": "completed",
                     "call_id": item.id,
-                    "name": item.name,
+                    "name": plain_name,
                     "input": unwrap_custom_input(&item.arguments),
-                }));
+                })
             } else {
-                output.push(json!({
+                json!({
                     "id": item.id,
                     "type": "function_call",
                     "status": "completed",
                     "call_id": item.id,
-                    "name": item.name,
+                    "name": plain_name,
                     "arguments": item.arguments,
-                }));
+                })
+            };
+            if let Some(namespace) = ns {
+                emitted["namespace"] = json!(namespace);
             }
+            output.push(emitted);
         }
 
         let mut response = self.response_skeleton("completed");
