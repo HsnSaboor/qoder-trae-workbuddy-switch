@@ -412,10 +412,31 @@ pub fn apply_fallback_headers(response: &mut axum::response::Response, info: &Fa
         ("x-buddy-fallback-from", info.from.as_str()),
         ("x-buddy-fallback-to", info.to.as_str()),
         ("x-buddy-fallback-reason", info.reason.as_str()),
+        // ★ 2026-11-01：一条**自解释**的告警头。
+        //
+        // 为什么需要：`from`/`to`/`reason` 三个头语义正确，但客户端（Claude Code /
+        // Codex / t3code）**一个都不显示** ⇒ 用户以为自己在用 `dfmodel`，实际每一轮
+        // 都在 `deepseek-v4.1-flash` 上跑。真机事故：Qoder 全系模型返回
+        // `403 {"code":"112","pricingUrl":…}`（套餐不含该模型），降级链把 100% 的
+        // 请求都接走了，而界面上毫无迹象 —— 用户以为「dfmodel 好好的」。
+        //
+        // 这条头把「你不在你选的模型上」写成一句人话，任何 `curl -D-` 或代理日志
+        // 都能一眼看到；`Warning` 语义也符合 RFC 7234 对「响应可能不是请求者本意」的定义。
+        (
+            "x-buddy-notice",
+            "请求的模型不可用，本次由备选模型作答（详见 x-buddy-fallback-* 头）",
+        ),
     ] {
         if let Ok(value) = HeaderValue::from_str(value) {
             headers.insert(name, value);
         }
+    }
+    // 标准 `Warning` 头（`199` = 杂项警告）：给只认标准头的工具也留一条线索。
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "199 - \"模型降级：{} -> {}\"",
+        info.from, info.to
+    )) {
+        headers.insert("warning", value);
     }
 }
 
