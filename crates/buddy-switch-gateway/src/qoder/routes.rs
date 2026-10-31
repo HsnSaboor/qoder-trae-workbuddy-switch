@@ -791,6 +791,8 @@ pub async fn chat_for_region_once(
                 QoderErrKind::ClientError => super::risk::note_rejected(),
                 QoderErrKind::BalanceExhausted => super::risk::note_exhausted(),
                 QoderErrKind::AuthDead | QoderErrKind::Transient => {}
+                // 套餐限制既不是风控也不是账号故障（凭据好着），只影响这一格。
+                QoderErrKind::PlanLimited => {}
             }
             {
                 let mut pools = state.pools.lock().await;
@@ -861,8 +863,31 @@ pub async fn chat_for_region_once(
             }
             None => String::new(),
         };
+        /* ★ 2026-10-31：池里**明明有账号**时不能这么说。
+        真机事故里 10 个带令牌的账号全在库，却回了 54 次「请在账号页导入」——
+        用户会去反复导入（导入并不能解开冷却），真正原因是这些号**此刻都不可选**：
+        全部处于模型/账号冷却、或被排除、或全在途。因此把**可读的逐号原因**带上。 */
+        let pool_state = {
+            let pools = state.pools.lock().await;
+            pools
+                .get(&region)
+                .map(|pool| {
+                    let total = pool.entries().count();
+                    let mut reasons: Vec<String> = pool
+                        .entries()
+                        .map(|entry| entry.describe(now_ms()))
+                        .collect();
+                    reasons.sort();
+                    reasons.truncate(6);
+                    format!(
+                        "；池内共 {total} 个账号，此刻均不可选：{}",
+                        reasons.join("、")
+                    )
+                })
+                .unwrap_or_else(|| "；池内还没有任何账号".to_string())
+        };
         format!(
-            "{} 没有可用账号：请在「账号」页导入（账号需带可调用的访问令牌）{scope_hint}",
+            "{} 没有可用账号{pool_state}{scope_hint}",
             region.display_name()
         )
     } else if all_quota {

@@ -64,6 +64,14 @@ pub enum QoderErrKind {
     /// ★ 402：**余额耗尽**。额度按每日 10:00（UTC+8）重置 ⇒ 短冷却毫无意义
     /// （几分钟后放出去只会再撞一次），要停到下一个重置窗口，见 `quota::park_exhausted`。
     BalanceExhausted,
+    /// ★ **套餐不含该模型**（403 + `code:"112"` + `pricingUrl`）。
+    ///
+    /// 上游用 403 报它，但**凭据完全正常** —— 同一账号换 `dfmodel` 立刻成功
+    /// （2026-10-31 实测）。从前它落进 `AuthDead`：账号被标 `auth_dead` + 30 分钟
+    /// 冷却，界面显示「凭据失效（需刷新令牌）」，而刷新令牌不可能解决套餐问题。
+    ///
+    /// 正确处置：**只冷这个模型**、不标 dead、不换号（换个号同样没有该套餐）。
+    PlanLimited,
 }
 
 impl QoderErrKind {
@@ -75,11 +83,14 @@ impl QoderErrKind {
             QoderErrKind::ClientError => "client_error",
             QoderErrKind::Queued => "queued",
             QoderErrKind::BalanceExhausted => "balance_exhausted",
+            QoderErrKind::PlanLimited => "plan_limited",
         }
     }
 
     /// 是否值得换号重试。
     pub fn should_rotate(self) -> bool {
+        // `PlanLimited` **要**换号：套餐是**每个账号各自**的事实（这 10 个号分属
+        // 不同用户、套餐档位不同），换个号很可能就有该模型。
         !matches!(self, QoderErrKind::ClientError)
     }
 }
@@ -153,6 +164,7 @@ pub fn client_error_of(status: u16, detail: &str) -> crate::failover::ClientErro
         QoderErrKind::RateLimited
         | QoderErrKind::Queued
         | QoderErrKind::BalanceExhausted
+        | QoderErrKind::PlanLimited
         | QoderErrKind::AuthDead => UpstreamEvent::SoftRate {
             reset_at_ms: None,
             model_scoped: false,
@@ -163,10 +175,47 @@ pub fn client_error_of(status: u16, detail: &str) -> crate::failover::ClientErro
     crate::failover::client_error(&event, "", "")
 }
 
-/// 带 body 的分类：`401/403` 里若是排队信号 ⇒ [`QoderErrKind::Queued`]（不惩罚账号）。
+/// 这条 detail 是不是「**套餐不含该模型**」信号（403 + `code:"112"` + `pricingUrl`）？
+///
+/// 真机原文：`{"code":"112","message":"{\"pricingUrl\":\"https://qoder.com/pricing?client=qoder\"}"}`。
+///
+/// 判据取**两个特征同时命中**（`112` + `pricingUrl`）：单看 `112` 容易误伤别家
+/// 同号错误码；单看 `pricingUrl` 又可能被将来别的「去升级」文案蹭到。
+pub(crate) fn plan_limited_signal(detail: &str) -> bool {
+    detail.contains("\"code\":\"112\"") || (detail.contains("112") && detail.contains("pricingUrl"))
+}
+
+/// 带 body 的分类：排队 / 套餐限制信号**优先于状态码**。
+///
+/// ## 为什么不能只在 `401/403` 里判（2026-10-31 真机事故）
+///
+/// 同一条排队错误，两条路径拿到的 `status` **不一样**：
+///
+/// | 路径 | status | 来源 |
+/// |:--|:--|:--|
+/// | 非流式（`chat_for_region_once` 直读响应） | `403` | 上游原始状态 |
+/// | 流式（`stream_relay` ← `UsageTapStream`） | **`429`** | `sse::process_line` 已把排队收敛成 429 |
+///
+/// 从前这里写着 `if matches!(status, 401 \| 403)`，于是流式路径的排队**落不到**
+/// `Queued` 分支，直接 `classify_http(429)` ⇒ `RateLimited` ⇒ 给该账号写 60 秒
+/// **模型冷却**。几秒内 10 个号全被写上 `dfmodel` 冷却，池子看起来「没有可用账号」，
+/// 对外就是 503 —— 而同一时刻同号立刻能成功。
+///
+/// 判据本来就是**内容**（`10605` / `isQueued` / `112` + `pricingUrl`），与状态码无关，
+/// 因此不再用状态码做前置门。真正的 429 限流不含这些字样，仍会落回 `RateLimited`。
 pub fn classify_http_with_detail(status: u16, detail: &str) -> QoderErrKind {
-    if matches!(status, 401 | 403) && queue_signal(detail) {
-        return QoderErrKind::Queued;
+    // ★ 只在这三种状态码上让**内容**优先：上游把排队塞在 401/403 信封里，而流式路径
+    //   已把它收敛成 429（见上表）。400 / 5xx 保持纯状态码判定 —— 那些 body 里的
+    //   数字多半是无关噪声，不该据此放过一次真实失败。
+    if matches!(status, 401 | 403 | 429) {
+        if queue_signal(detail) {
+            return QoderErrKind::Queued;
+        }
+        // ★ 套餐限制：上游用 403 报，但凭据好着（同一账号换模型立刻成功）。从前落进
+        //   `AuthDead` ⇒ 账号被标「凭据失效」+ 30 分钟冷却，而刷新令牌解决不了套餐问题。
+        if plan_limited_signal(detail) {
+            return QoderErrKind::PlanLimited;
+        }
     }
     classify_http(status)
 }
@@ -314,6 +363,23 @@ impl PoolEntryLike for QoderPoolEntry {
 
     fn cool_expiry_ms(&self) -> i64 {
         self.cooldown_until
+    }
+
+    /// ★ 必须覆写：默认实现恒返回 `0`（「本产品线不做模型级冷却」）。
+    ///
+    /// Qoder **确实**按模型冷却（[`QoderPool::apply_error`] 的 `RateLimited` 分支写
+    /// `model_cooldowns`）。不覆写时 [`crate::pool::pick_earliest_expiry`] 里的
+    /// `effective_cool_expiry_ms` 会取 `max(cooldown_until, 0)` —— 于是「只被该模型
+    /// 冷落、账号本身健康」的账号被算成「没有冷却」而**全部被兜底过滤掉**，
+    /// 池里明明有号却返回「没有可用账号」。
+    ///
+    /// 真机症状（2026-10-31，dfmodel 上游排队）：日志里一串 `429 queue` 紧跟着
+    /// 一串 `503 没有可用账号`，而账号库有 10 个带令牌的账号、且随后同号立刻成功。
+    fn model_cool_expiry_ms(&self, model: &str) -> i64 {
+        self.model_cooldowns
+            .get(model)
+            .map(|until| *until)
+            .unwrap_or(0)
     }
 
     fn is_hard_cooled(&self, _now_ms: i64) -> bool {
@@ -591,6 +657,13 @@ impl QoderPool {
                 entry.auth_dead = true;
                 entry.cooldown_until = now + 30 * 60_000;
                 entry.cooldown_reason = Some("凭据失效（需刷新令牌）".to_string());
+            }
+            QoderErrKind::PlanLimited => {
+                // 只冷**这个模型**（与 `RateLimited` 同一处置）：账号仍服务其它模型，
+                // 且**绝不**标 `auth_dead` —— 凭据是好的，套餐问题刷新令牌解决不了。
+                entry
+                    .model_cooldowns
+                    .insert(model.to_string(), now + 6 * 60 * 60_000);
             }
             QoderErrKind::Transient => {
                 entry.cooldown_until = now + 10_000;
@@ -1107,9 +1180,19 @@ mod tests {
             classify_http_with_detail(401, "token expired"),
             QoderErrKind::AuthDead
         );
-        // 其它状态码不受影响。
+        /* ★ 429 + 排队信号 ⇒ **仍然是 Queued**（2026-10-31 真机事故的根因）。
+        流式路径拿到的就是这个组合：`sse::process_line` 把排队收敛成 `code:429`，
+        `UsageTapStream` 再把上游原文放进 `upstream`。从前这里断言 `RateLimited`，
+        于是每次排队都给账号写 60 秒模型冷却 ⇒ 10 个号几秒内全冷 ⇒ 对外 503
+        「没有可用账号」，而同一时刻同号立刻能成功。
+        可证伪：把 `matches!(status, 401 | 403 | 429)` 改回 `401 | 403` ⇒ 本行红。 */
         assert_eq!(
             classify_http_with_detail(429, "10605"),
+            QoderErrKind::Queued
+        );
+        // 真·429 限流（body 里没有排队字样）仍是限流。
+        assert_eq!(
+            classify_http_with_detail(429, "rate limit exceeded"),
             QoderErrKind::RateLimited
         );
         assert_eq!(
@@ -1154,6 +1237,80 @@ mod tests {
         assert_eq!(classify_http(400), QoderErrKind::ClientError);
         assert_eq!(classify_http(401), QoderErrKind::AuthDead);
         assert_eq!(classify_http(429), QoderErrKind::RateLimited);
+    }
+
+    /// ★ 回归：Qoder 条目必须实现 `model_cool_expiry_ms`。
+    ///
+    /// 默认实现恒返回 0（「本产品线不做模型级冷却」）。Qoder 侧**确实**按模型冷却
+    /// （`apply_error` 对 `RateLimited` 写 `model_cooldowns`），若不覆写：
+    /// `pick_earliest_expiry` 的 `effective_cool_expiry_ms` 会把每个「只被该模型冷落」
+    /// 的账号算成「没有冷却」⇒ 兜底把它们全部过滤掉 ⇒ 池里有号却返回
+    /// 「没有可用账号」。真机症状：日志里全是 429 queue、紧跟着一串 503。
+    #[test]
+    fn qoder_entry_reports_model_cooldown_through_the_trait() {
+        let mut entry = entry("u1", "dt-token");
+        entry.model_cooldowns.insert("dfmodel".to_string(), 999_999);
+        assert_eq!(
+            <QoderPoolEntry as crate::pool::PoolEntryLike>::model_cool_expiry_ms(&entry, "dfmodel"),
+            999_999,
+            "必须读 model_cooldowns，否则兜底会把冷却中的号全过滤掉"
+        );
+        assert_eq!(
+            <QoderPoolEntry as crate::pool::PoolEntryLike>::model_cool_expiry_ms(&entry, "qfmodel"),
+            0,
+            "其它模型不受影响"
+        );
+    }
+
+    /// ★ 套餐限制（403 + `code:"112"` + `pricingUrl`）**不是**凭据死。
+    ///
+    /// 真机原文（2026-10-31）：
+    /// `{"code":"112","message":"{\"pricingUrl\":\"https://qoder.com/pricing?client=qoder\"}"}`。
+    /// 从前它落进 `AuthDead` ⇒ 账号被标「凭据失效」+ 30 分钟冷却 + 界面提示「需刷新令牌」，
+    /// 而同一账号换 `dfmodel` 立刻成功 —— 刷新令牌永远解决不了套餐问题。
+    ///
+    /// 可证伪：删掉 `classify_http_with_detail` 里的 `plan_limited_signal` 分支 ⇒
+    /// 第一条断言拿到 `AuthDead`。
+    #[test]
+    fn plan_limited_403_is_not_auth_dead() {
+        let raw = r#"HTTP 403：{"code":"112","message":"{"pricingUrl":"https://qoder.com/pricing?client=qoder"}"}"#;
+        assert_eq!(
+            classify_http_with_detail(403, raw),
+            QoderErrKind::PlanLimited
+        );
+        assert!(
+            QoderErrKind::PlanLimited.should_rotate(),
+            "换个号可能有该套餐"
+        );
+        assert_eq!(QoderErrKind::PlanLimited.as_str(), "plan_limited");
+
+        // 真·凭据失效仍必须落 `AuthDead`（别被 112 判据误伤）。
+        assert_eq!(
+            classify_http_with_detail(403, r#"{"code":"403","message":"invalid token"}"#),
+            QoderErrKind::AuthDead
+        );
+    }
+
+    /// ★ 套餐限制只冷**该模型**：不标 `auth_dead`、不动账号级冷却。
+    ///
+    /// 可证伪：把 `apply_error` 的 `PlanLimited` 分支换成 `AuthDead` 的处置 ⇒
+    /// `auth_dead` 断言红（账号会显示「凭据失效（需刷新）」）。
+    #[test]
+    fn plan_limited_only_cools_that_model() {
+        let mut pool = QoderPool::new();
+        pool.entries.insert("a".into(), entry("a", "t-a"));
+        pool.apply_error("a", QoderErrKind::PlanLimited, "112 pricingUrl", "gfmodel");
+        let e = &pool.entries["a"];
+        assert!(!e.auth_dead, "套餐限制不是凭据死（刷新令牌救不了）");
+        assert_eq!(e.cooldown_until, 0, "不得设账号级冷却");
+        assert!(
+            e.model_cooldowns.get("gfmodel").copied().unwrap_or(0) > 0,
+            "必须冷住这个模型"
+        );
+        assert!(
+            e.model_cooldowns.get("dfmodel").is_none(),
+            "其它模型不受影响"
+        );
     }
 
     /// `apply_error(Queued)` 不改 `auth_dead` / 冷却 / EMA —— 只留痕。

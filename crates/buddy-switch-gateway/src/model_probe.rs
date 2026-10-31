@@ -612,6 +612,9 @@ pub fn probe_state_of_qoder(status: u16, detail: &str) -> ProbeState {
         // 402：账号级余额耗尽。探测的「一格」是**模型**维度，这里如实报上游错误
         // （把账号标成「凭据死」是错的 —— 凭据好着，只是没钱了）。
         QoderErrKind::BalanceExhausted => ProbeState::UpstreamError,
+        // 套餐不含该模型：这一格（账号 × 模型）确实不可用，但**不是**凭据死。
+        // 归到 `ModelUnavailable`（「该账号看不到这个模型」）语义最贴切。
+        QoderErrKind::PlanLimited => ProbeState::ModelUnavailable,
     }
 }
 
