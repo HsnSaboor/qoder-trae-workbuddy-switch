@@ -117,6 +117,10 @@ enum Behavior {
     Always400,
     /// 正常响应，但把每次的**解码后**请求体记下来（验证出站清洗用）。
     Record(Arc<Mutex<Vec<String>>>),
+    /// HTTP 200 + **首帧就是信封错误**（`statusCodeValue: 403` + `10605` 排队）——
+    /// 2026-11-01 zaibi 真机形态：`dfmodel` 排队时上游正是这样回的。
+    /// 验证「流式首帧即错误 ⇒ 换模型」而不是「200 + 半截流 + error 帧」。
+    EnvelopeErrorFirst,
 }
 
 /// 真机取证（2026-10-17，Qoder CN）里「编码体 + 漏 `?Encode=1`」时上游回的三行。
@@ -170,6 +174,27 @@ async fn mock_chat(
             .body(Body::from(NON_ENVELOPE_ERROR_FRAMES))
             .expect("构造 mock 响应");
     }
+    /* ★ 首帧即信封错误（zaibi 真机：`dfmodel` 排队回 `403` + `10605`）。
+    流式路径必须据此**换模型**，而不是把 200 与半截流发出去。 */
+    if matches!(behavior, Behavior::EnvelopeErrorFirst) {
+        let line = json!({
+            "body": json!({
+                "code": "10605",
+                "message": json!({
+                    "isQueued": true,
+                    "modelKey": "ultimate",
+                    "retryAfterSeconds": 30,
+                    "serviceAvailable": false
+                }).to_string()
+            }).to_string(),
+            "statusCodeValue": 403
+        });
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(format!("data:{line}\n")))
+            .expect("构造 mock 响应");
+    }
     /* ★ 自动降级（issue #72）：第一次回 400（参数错），之后正常；并把解码后的
     请求体记下来 —— 断言「第二发确实是文本模式」需要看到**请求体**，不是响应。 */
     if let Behavior::RejectFirst(seen) = &behavior {
@@ -213,6 +238,8 @@ async fn mock_chat(
         Behavior::Normal | Behavior::NonEnvelopeError => false,
         // 已在上面单独处理（第一次回 400，之后放行 / 一直 400 / 只记录）。
         Behavior::RejectFirst(_) | Behavior::Always400 | Behavior::Record(_) => false,
+        // 已在上面单独处理（首帧即信封错误）。
+        Behavior::EnvelopeErrorFirst => false,
     };
     if should_fail {
         return Response::builder()
@@ -485,9 +512,49 @@ async fn chat_stream_surfaces_non_envelope_error_frame() {
         "首帧即错误必须报真实状态码，否则外层无法降级"
     );
     let text = body_text(response).await;
+    /* 对外文案是**收敛后**的类别描述（不拼上游原文，见 issue #129）：
+       这里只要证明「错误确实传给了客户端」，不钉具体措辞。 */
     assert!(
-        text.contains("Internal Server Error"),
-        "错误原因必须让客户端看到: {text}"
+        text.contains("upstream_error") || text.contains("event:error"),
+        "错误必须让客户端看到: {text}"
+    );
+}
+
+/// **首帧即信封错误**（`statusCodeValue: 403` + `10605` 排队）⇒ 流式也必须报真实
+/// 状态码，而不是「200 + `response.created` + error 帧」。
+///
+/// 这是 zaibi 真机（2026-11-01 / codex）的形态：上游把排队塞在 403 信封里，
+/// 通用嗅探器看不懂信封 ⇒ 旧实现照常提交响应头，客户端拿到半截流后报
+/// `stream disconnected before completion`，整轮失败且**无法换模型**。
+///
+/// 可证伪：把 `peek_qoder_first_frame` 换回通用 `relay::peek_first_frame`
+/// （它不认信封）⇒ 本用例拿到 200，立刻变红。
+#[tokio::test]
+async fn chat_stream_degrades_when_first_frame_is_envelope_error() {
+    let _guard = guard();
+    let (state, key) = gateway_for(
+        "enverrfirst",
+        &[("q1", "dt-1")],
+        Behavior::EnvelopeErrorFirst,
+    )
+    .await;
+    let response = router(state)
+        .oneshot(chat_request(
+            Some(&key),
+            r#"{"model": "ultimate", "stream": true, "messages": []}"#,
+        ))
+        .await
+        .expect("请求");
+    // 首帧即错误 ⇒ 响应头还没提交 ⇒ 如实报错，外层据此换模型。
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "排队（信封 403 + 10605）必须映射成 429 交给外层降级，不能回 200"
+    );
+    let text = body_text(response).await;
+    assert!(
+        !text.contains("response.created"),
+        "绝不能把半截事件流发给客户端: {text}"
     );
 }
 

@@ -722,7 +722,7 @@ pub async fn chat_for_region_once(
                 「这一跳彻底失败」，按既有判据换下一个模型 —— 客户端一个字节都还没收到。
                 首帧不是错误 ⇒ 原样拼回流首，字节与顺序完全不变。 */
                 let (response, prefix, early_error) = if wants_stream {
-                    crate::routes::relay::peek_first_frame(response).await
+                    peek_qoder_first_frame(response).await
                 } else {
                     (response, None, None)
                 };
@@ -741,7 +741,12 @@ pub async fn chat_for_region_once(
                             pool.apply_error(&uid, kind, &found.message, &model);
                         }
                     }
-                    let http = StatusCode::from_u16(found.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                    /* 状态码走 `client_error_of` 归一：排队 / 限流 / 凭据死都映射成 429
+                    （对客户端与降级链都是「这个号/模型此刻不行」），而不是原样透出
+                    上游的 403 —— 原样 403 会被外层当成「客户端参数错」而不降级。 */
+                    let mapped = super::pool::client_error_of(found.code, &found.message);
+                    let http = StatusCode::from_u16(mapped.status)
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
                     return protocol_error(protocol, http, "upstream_error", &found.message);
                 }
                 if degrade_pending {
@@ -1066,6 +1071,58 @@ fn usage_credits(usage: &Value) -> f64 {
         .or_else(|| usage.get("original_credits").and_then(Value::as_f64))
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(0.0)
+}
+
+/// **Qoder 专属**的首帧窥探：用信封解包器判定「首帧就是上游错误」。
+///
+/// ## 为什么不能复用 `relay::peek_first_frame`
+///
+/// 那个用的是**通用** `error_sniffer::sniff_sse_chunk`，它只认 `event: error` /
+/// `{"error":…}` 这类形状。Qoder 的错误藏在**信封**里
+/// （`{"statusCodeValue":403,"body":"{\"code\":\"10605\",…}"}`），通用嗅探器看不懂
+/// ⇒ 判定为「首帧正常」，于是响应头照常提交，换模型的窗口就错过了。
+///
+/// 真机（2026-11-01 / zaibi / codex）：`dfmodel` 排队时上游回
+/// `statusCodeValue != 200`，通用嗅探漏判，客户端拿到
+/// `response.created` → `response.in_progress` → `event: error (429)`。
+///
+/// 这里改用 [`api::unwrap_envelope_line`] —— 与流本身**同一个**解包器，
+/// 两边对「什么算错误」的判据不可能漂移。
+///
+/// 返回 `(响应, 首块, 错误)`：
+/// - 首帧是错误 ⇒ `(响应, None, Some(..))`，调用方据此换模型（一个字节都没发出去）；
+/// - 否则 ⇒ `(响应, Some(首块), None)`，调用方用 `prefix_stream` 原样拼回。
+async fn peek_qoder_first_frame(
+    mut response: reqwest::Response,
+) -> (
+    reqwest::Response,
+    Option<Bytes>,
+    Option<super::sse::UpstreamError>,
+) {
+    // 等首帧的上限：正常首字节在秒级，20s 足够覆盖慢上游（与 WB 侧同一取值）。
+    const FIRST_FRAME_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    let first = match tokio::time::timeout(FIRST_FRAME_WAIT, response.chunk()).await {
+        Ok(Ok(Some(chunk))) => chunk,
+        // 超时 / 传输错误 / 空体：都不判，原样交回（宁可照常转发，也不凭空造错误）。
+        _ => return (response, None, None),
+    };
+
+    let text = String::from_utf8_lossy(&first);
+    for line in text.lines() {
+        if let api::ChatFrame::UpstreamError { status, detail } = api::unwrap_envelope_line(line) {
+            return (
+                response,
+                None,
+                Some(super::sse::UpstreamError {
+                    // `code` = 等价 HTTP 状态（缺省 502），`message` = 上游详情。
+                    code: status,
+                    message: detail,
+                }),
+            );
+        }
+    }
+    (response, Some(first), None)
 }
 
 /// 流式中继：驱动转换流 → mpsc → 响应体；**流结束回调里**记账（绝不提前写日志）。
