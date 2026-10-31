@@ -32,8 +32,6 @@ fn content_to_text(content: &Value) -> String {
     }
 }
 
-
-
 /// 把 `tool_result.content` 拆成 (文本, 图片 URL 列表)。
 ///
 /// ★ 图片**必须**单独拎出来走多模态 parts：`role:"tool"` 的 `content` 只能是字符串，
@@ -612,6 +610,11 @@ pub struct AnthropicSseStream<S> {
     /// 上游报的缓存命中 token（`prompt_tokens_details.cached_tokens` 等形态）。
     cache_read_tokens: u64,
     stop_reason: String,
+    /// 已见到上游 `finish_reason`（但**还没**收尾 —— usage 可能在它之后单独一帧）。
+    ///
+    /// 它只用于区分「流在说完之后断了」与「流说到一半断了」：前者照常 `finalize()`，
+    /// 后者才走失败路径。
+    stop_seen: bool,
     pending: VecDeque<Bytes>,
     /// ★ issue #129：账号故障自动切换的失败信号（`None` = 开关关闭 / 未接入）。
     ///
@@ -646,6 +649,7 @@ impl<S> AnthropicSseStream<S> {
             estimated_input: 0,
             cache_read_tokens: 0,
             stop_reason: "end_turn".to_string(),
+            stop_seen: false,
             pending: VecDeque::new(),
             failover: None,
         }
@@ -832,14 +836,21 @@ impl<S> AnthropicSseStream<S> {
 
         // `finish_reason` 的**空值形态**不是终止信号：上游 OpenAI 兼容实现常在中间分片里
         // 写 `""`（而非标准的 `null`）。`as_str()` 对 `""` 会返回 `Some("")`，若直接据此
-        // `finalize`，转换流会在第一个分片就收尾，客户端表现为「流式对话刚开始就断了」。
+        // 收尾，转换流会在第一个分片就结束，客户端表现为「流式对话刚开始就断了」。
+        //
+        // ★ 2026-10-31：见到 `finish_reason` **只记 stop_reason，不立刻 finalize**。
+        // Qoder 上游把 `usage` 放在**收尾帧之后**单独一帧（`choices: []` + `usage`），
+        // 而 `[DONE]` 才是真正的流末 —— 在这里就收尾会让 `message_delta` 永远拿不到
+        // 真实 `prompt_tokens` / `cached_tokens`（实测 `cache_read_input_tokens` 恒 0，
+        // 与 Responses 出口的「流末才 finish」口径也不一致）。收尾交给
+        // `[DONE]` / EOF（见 `ingest` 与 `poll_next`）。
         if let Some(finish_reason) = choice
             .get("finish_reason")
             .and_then(Value::as_str)
             .filter(|reason| !reason.is_empty())
         {
             self.stop_reason = map_stop_reason(Some(finish_reason)).to_string();
-            self.finalize();
+            self.stop_seen = true;
         }
     }
 
@@ -1052,7 +1063,9 @@ where
                     /* ★ issue #129 §3.3：断流是**账号级失败**，不是「模型说完了」。
                     开关开启时发 `event: error`（可重试）而不是 `finalize()` 补
                     `message_stop` —— 后者会让客户端把半句话当成完整回答。 */
-                    if !this.fail_on_break() {
+                    // ★ 说完之后断流（`finish_reason` 已到）不是账号故障：正文已经完整，
+                    //   只丢了末帧 usage —— 报 `error` 反而会让客户端把完整回答重跑一遍。
+                    if this.stop_seen || !this.fail_on_break() {
                         this.finalize();
                     }
                 }
@@ -1094,6 +1107,35 @@ mod tests {
         assert!(
             !text.contains("event: error"),
             "关闭时不得发错误事件：{text}"
+        );
+    }
+
+    /// ★ 2026-10-31：`finish_reason` 之后断流是**正常结束**，不是账号故障。
+    ///
+    /// Qoder 把 `usage` 放在收尾帧之后单独一帧；若那帧没到就断流（或客户端提前关流），
+    /// 正文已经完整。此时报 `event: error` 会让客户端把一段完整回答整步重跑 ——
+    /// 比「末帧 usage 缺失」贵得多。
+    ///
+    /// 可证伪：去掉 `stop_seen` 判据 ⇒ 本用例红（会发 `event: error`）。
+    #[tokio::test]
+    async fn broken_stream_after_finish_reason_still_finalizes() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let signal = crate::failover::StreamFailure::new(true);
+        signal.record(crate::pool::UpstreamEvent::Server, "上游连接中断");
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string())
+            .with_failover(Some(signal), "一号");
+        let events: Vec<Bytes> = stream.map(|item| item.unwrap()).collect().await;
+        let text = collect_text(&events);
+        assert!(text.contains("done"), "{text}");
+        assert!(text.contains("message_stop"), "{text}");
+        assert!(
+            !text.contains("event: error"),
+            "说完之后断流不得报错（会把完整回答逼成重跑）：{text}"
         );
     }
 
@@ -1650,6 +1692,50 @@ mod tests {
         let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string());
         let text = collect_text(&stream.map(|item| item.unwrap()).collect::<Vec<_>>().await);
         assert!(text.contains("\"input_tokens\":0"));
+    }
+
+    /// ★ 2026-10-31：Qoder 上游把 `usage` 放在**收尾帧之后**单独一帧。
+    ///
+    /// 真实形状（真机抓包，`qoder-global:dfmodel`）：
+    /// `…{"choices":[{"delta":{},"finish_reason":"stop"}]}` → `{"choices":[],"usage":{…}}`
+    /// → `[DONE]`。若见到 `finish_reason` 就 `finalize`，`message_delta` 会停在**估算值**
+    /// 且 `cache_read_input_tokens` 恒 0（客户端看到的「缓存读取」永远是 0，与
+    /// 「确实没命中」不可区分）。
+    ///
+    /// 可证伪：把 `handle_delta` 里的 `finalize()` 加回 `finish_reason` 分支 ⇒ 本用例红。
+    #[tokio::test]
+    async fn message_delta_uses_usage_that_arrives_after_finish_reason() {
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5938,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":5632}}}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let stream = AnthropicSseStream::new(futures_util::stream::iter(chunks), "m".to_string())
+            .with_estimated_input(1200);
+        let text = collect_text(&stream.map(|item| item.unwrap()).collect::<Vec<_>>().await);
+        let delta = text
+            .split("event: message_delta")
+            .nth(1)
+            .unwrap_or_else(|| panic!("必须有 message_delta：{text}"));
+        assert!(
+            delta.contains("\"input_tokens\":5938"),
+            "message_delta 必须用收尾帧之后的真实 prompt_tokens：{text}"
+        );
+        assert!(
+            delta.contains("\"cache_read_input_tokens\":5632"),
+            "缓存命中量必须送达客户端：{text}"
+        );
+        assert!(
+            delta.contains("\"output_tokens\":2"),
+            "输出 token 必须送达客户端：{text}"
+        );
     }
 
     /// ★ issue #139：缓存命中量必须映射到 `cache_read_input_tokens`（dsh 单列一行显示）。
