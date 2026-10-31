@@ -452,7 +452,16 @@ async fn chat_non_envelope_error_is_not_a_silent_empty_completion() {
     assert!(text.contains("Internal Server Error"), "{text}");
 }
 
-/// 同一形态走流式：错误帧要转发给客户端（不是只补一个 [DONE]），且仍然不悬挂。
+/// 同一形态走流式：**首帧即错误** ⇒ 在提交响应头之前就判定这一跳失败。
+///
+/// ★ 2026-11-01 行为变更：从前这里断言「200 + 错误帧转发给客户端」。那正是
+/// `/v1/responses` 流式无法换模型的根因 —— 响应头一旦发出去，外层 hop 循环再也
+/// 拿不到「这一跳彻底失败」的信号，只能把错误帧当结局转给客户端（codex 于是报
+/// `stream disconnected before completion`）。现在改成**先 peek 首帧**：首帧是错误
+/// 信封就返回真实的错误状态码，外层据此换下一个模型（客户端一个字节都还没收到）。
+///
+/// 可证伪：把 `chat_for_region_once` 里的 `peek_first_frame` 分支删掉 ⇒ 状态码回到
+/// 200，本用例立刻变红。
 #[tokio::test]
 async fn chat_stream_surfaces_non_envelope_error_frame() {
     let _guard = guard();
@@ -469,12 +478,17 @@ async fn chat_stream_surfaces_non_envelope_error_frame() {
         ))
         .await
         .expect("请求");
-    // 流式响应头在读到上游帧之前就发了 ⇒ 状态仍是 200，错误只能在帧里。
-    assert_eq!(response.status(), StatusCode::OK);
+    // 首帧即错误 ⇒ 响应头**还没**提交 ⇒ 如实报错，而不是 200 + 错误帧。
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "首帧即错误必须报真实状态码，否则外层无法降级"
+    );
     let text = body_text(response).await;
-    assert!(text.contains("\"error\""), "错误帧必须转发给客户端: {text}");
-    assert!(text.contains("Internal Server Error"), "{text}");
-    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert!(
+        text.contains("Internal Server Error"),
+        "错误原因必须让客户端看到: {text}"
+    );
 }
 
 /// issue #72：**自动降级**。结构化历史被上游按参数错（400）拒 ⇒ 网关用**同一账号**、

@@ -705,6 +705,45 @@ pub async fn chat_for_region_once(
 
             let status = response.status();
             if status.is_success() {
+                /* ★ 2026-11-01：流式也要能**换模型**，不只是换号。
+
+                上游「排队 / 限流」常常是 **HTTP 200 + 首帧就是 error 信封**
+                （Qoder 的 `403/10605` 解包后正是这种形态）。旧实现里 `stream_relay`
+                一进来就发 `message_start` / `response.created`，响应头当场提交 ⇒
+                客户端已收到 200 与半截事件流，此后再没有「这一跳彻底失败」的信号。
+
+                真机症状（zaibi / codex）：`/v1/responses` 流式拿到
+                `response.created` → `response.in_progress` → `event: error (429)`，
+                codex 报 `stream disconnected before completion`；同一模型**非流式**
+                却正常（降级发生在提交响应头之前）。
+
+                所以在**提交响应头之前**先看一帧：首帧即错误信封 ⇒ 把它转成一个
+                **真实的错误状态码**返回。外层 `chat_for_region` 的 hop 循环因此拿到
+                「这一跳彻底失败」，按既有判据换下一个模型 —— 客户端一个字节都还没收到。
+                首帧不是错误 ⇒ 原样拼回流首，字节与顺序完全不变。 */
+                let (response, prefix, early_error) = if wants_stream {
+                    crate::routes::relay::peek_first_frame(response).await
+                } else {
+                    (response, None, None)
+                };
+                if let Some(found) = early_error {
+                    /* 记冷却：排队（`isQueued` / `10605`）走 `Queued` —— 账号本身没问题，
+                    不该冷却；其余按 `RateLimited` 处理（「稍后重试」语义最接近）。
+                    与真 5xx 同一处置路径，同一个账号不会被反复撞。 */
+                    let kind = if super::pool::queue_signal(&found.message) {
+                        super::pool::QoderErrKind::Queued
+                    } else {
+                        super::pool::QoderErrKind::RateLimited
+                    };
+                    {
+                        let mut pools = state.pools.lock().await;
+                        if let Some(pool) = pools.get_mut(&region) {
+                            pool.apply_error(&uid, kind, &found.message, &model);
+                        }
+                    }
+                    let http = StatusCode::from_u16(found.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                    return protocol_error(protocol, http, "upstream_error", &found.message);
+                }
                 if degrade_pending {
                     // 文本模式重发成功 ⇒ 结论坐实：这个 (区域, 模型) 的结构化历史不被接受。
                     super::degrade::note_rejected(region, &meta.key);
@@ -722,6 +761,9 @@ pub async fn chat_for_region_once(
                     stream_relay(
                         state,
                         response,
+                        // 上面 peek 取走的首帧（`None` = 没 peek / 非流式）：必须拼回流首，
+                        // 否则客户端会丢掉第一个事件。`prefix_stream` 保证顺序不变。
+                        prefix,
                         protocol,
                         region,
                         &model,
@@ -1031,6 +1073,8 @@ fn usage_credits(usage: &Value) -> f64 {
 async fn stream_relay(
     state: QoderGatewayState,
     response: reqwest::Response,
+    // peek 取走的首帧（`None` = 没 peek 过）。拼回流首后字节与顺序不变。
+    prefix: Option<Bytes>,
     protocol: Protocol,
     region: QoderRegion,
     model: &str,
@@ -1049,7 +1093,9 @@ async fn stream_relay(
     // ★ issue #139：Anthropic 出口 `message_start` 的输入 token 估算（0 = 不估）。
     estimated_input: u64,
 ) -> Response {
-    let upstream = response.bytes_stream();
+    // ★ 首帧可能在 `peek_first_frame` 里被取走：用 `prefix_stream` 拼回去，
+    //   客户端收到的字节与顺序和「没 peek 过」逐字相同。
+    let upstream = crate::routes::relay::prefix_stream(prefix, response);
     let stream_model = model.to_string();
     let usage_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
     // 上游错误帧留痕：流式账本在流结束才落，没有它就只能记成「200 + 0 token」。
