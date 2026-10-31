@@ -586,7 +586,8 @@ selector 必须写细粒度（`check-store-selectors.cjs` 会拦）。
 | 超时降级 | **已实现**（第三轮） | `UpstreamErrorKind::Timeout` 由 `reqwest::Error::is_timeout()` 判定（对外 504 / `type: timeout`），`UpstreamEvent::Timeout` 单列一档。冷却处置与 5xx 一致，**降级判据独立** |
 | Trae / Qoder 网关 | **前后端都已接**：Trae 三个入口 + Qoder 三个协议入口包了 hop 循环；三个网关页都渲染同一张卡片 | 判定只能看**响应状态码**（5xx ⇒ 服务端故障、429 ⇒ 限流），比 WB 的「按上游事件类型」粗一档；**用户配的 `triggers` 白名单照常生效**。卡片通过 `scope` + `modelOptions` 两个 prop 平台化（Trae 的清单来自客户端 `vscdb`、Qoder 的来自上游实时拉取，都不在 gateway store 里） |
 | **同平台跨区域**（`wb-cn` → `wb-global`） | ✅ **已支持** | 换 region 走正常路径即可：协议一致，只是账号池与上游域名不同 |
-| **跨平台**（`wb-cn` → `trae-cn`） | ✅ **三个入口都支持**（限深一层） | 走 `routes::cross::relay_on_scope`（同进程内调目标产品线入口，协议都是 OpenAI 形态）。`A → B → A` 的循环由 **`task_local` 限深**挡住（`MAX_CROSS_DEPTH = 1`，超限 502 `fallback_cross_depth_exceeded`），不是靠禁止功能 |
+| **跨平台**（`wb-cn` → `trae-cn`） | ✅ **三个入口都支持**（限深一层） | 走 `routes::cross::relay_on_scope`（同进程内调目标产品线入口）。**协议随入口走**：`CrossProtocol::{OpenAi, Anthropic, Responses}` 决定目标产品线用哪条入口，从而保证「收到什么协议、回什么协议」。`A → B → A` 的循环由 **`task_local` 限深**挡住（`MAX_CROSS_DEPTH = 1`，超限 502 `fallback_cross_depth_exceeded`），不是靠禁止功能 |
+| **跨作用域的协议错配**（2026-10-31 事故） | ✅ **已修复** | 旧实现把目标入口**写死成 chat**，于是 `/v1/messages` 跨作用域降级后客户端拿到 `HTTP 200` + `{"object":"chat.completion",…}`（Claude Code 报 `body is JSON but not a Message`）；流式则「只收到 1 个事件」。现在按入口协议分派，三条产品线各用自己的同协议入口 |
 | 请求体没有 `model` 字段 | **不降级**（三条线一致） | 客户端不传 model 时中继用配置默认模型 / 清单第一条，我们**不知道**是哪个 —— 改写 body 是 no-op，硬改会变成「每跳发同一个模型却告诉客户端降到了备选」= 对客户端撒谎 |
 | Trae **流式**请求 | 基本不触发降级 | 上游错误多在 SSE 流内，此时响应头已发（200）⇒ 没有「这一跳彻底失败」的信号。非流式会降级（错误体完整、状态码 502）。**这是平台差异，不是 bug**，卡片文案要说清 |
 | 失败时返回结构化 `fallback` 对象 | **已实现**：错误体顶层多一个 `fallback` 键（`Upstream` 错误同时追加一句人读文本） | 不能塞进 `GatewayError`（每个变体的状态码与 `type` 都被契约钉着），但**顶层加键是纯增量**。不用「只追加文本」是因为最后一跳可能是 `no_credential`（没有可变 message）—— 那正是最需要轨迹的时候（e2e 测试钉住） |

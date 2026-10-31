@@ -409,6 +409,7 @@ pub async fn chat_for_variant(
         let hop_body = Bytes::from(hop_body);
         // ★ 跨平台目标：交给 `cross::relay_on_scope`（同进程内调目标产品线入口）。
         //   深度由 `cross_depth()` 兜底（`FallbackLoop::plan` 已先过滤一次）。
+        //   ★ 协议随入口走：这是 `/v1/chat/completions` ⇒ `OpenAi`。
         let response = if fallback
             .scope_at(hop)
             .is_some_and(|target_scope| target_scope.product() != scope.product())
@@ -418,6 +419,7 @@ pub async fn chat_for_variant(
                 axum::http::HeaderMap::new(),
                 hop_body.clone(),
                 None,
+                crate::routes::cross::CrossProtocol::OpenAi,
             ))
             .await
         } else if stream {
@@ -632,6 +634,8 @@ pub async fn messages_for_variant(
         let hop_body = Bytes::from(hop_body);
         // ★ 跨平台目标：交给 `cross::relay_on_scope`（同进程内调目标产品线入口）。
         //   深度由 `cross_depth()` 兜底（`FallbackLoop::plan` 已先过滤一次）。
+        //   ★ 协议随入口走：这是 `/v1/messages` ⇒ `Anthropic`。写死成 OpenAI 会让
+        //     客户端收到 200 + `chat.completion` 正文（真机事故见 `cross` 模块文档）。
         let response = if fallback
             .scope_at(hop)
             .is_some_and(|target_scope| target_scope.product() != scope.product())
@@ -641,6 +645,7 @@ pub async fn messages_for_variant(
                 axum::http::HeaderMap::new(),
                 hop_body.clone(),
                 None,
+                crate::routes::cross::CrossProtocol::Anthropic,
             ))
             .await
         } else if stream {
@@ -885,6 +890,7 @@ pub async fn responses_for_variant(
         let hop_body = Bytes::from(hop_body);
         // ★ 跨平台目标：交给 `cross::relay_on_scope`（同进程内调目标产品线入口）。
         //   深度由 `cross_depth()` 兜底（`FallbackLoop::plan` 已先过滤一次）。
+        //   ★ 协议随入口走：这是 `/v1/responses` ⇒ `Responses`。
         let response = if fallback
             .scope_at(hop)
             .is_some_and(|target_scope| target_scope.product() != scope.product())
@@ -894,6 +900,7 @@ pub async fn responses_for_variant(
                 axum::http::HeaderMap::new(),
                 hop_body.clone(),
                 None,
+                crate::routes::cross::CrossProtocol::Responses,
             ))
             .await
         } else if stream {

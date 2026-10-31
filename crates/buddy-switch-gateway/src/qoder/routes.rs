@@ -379,6 +379,8 @@ pub async fn chat_for_region(
             .map(crate::routes::cross::qoder_region_of)
             .unwrap_or(region);
         // ★ 跨平台目标：交给 `cross::relay_on_scope`（同进程内调目标产品线入口）。
+        //   ★ 必须把**入口协议**一并传过去：目标产品线按它选入口，否则 Anthropic
+        //     请求会拿回 OpenAI `chat.completion` 正文（HTTP 200 + 非 Message）。
         let response = if fallback
             .scope_at(hop)
             .is_some_and(|target_scope| target_scope.product() != scope.product())
@@ -388,6 +390,11 @@ pub async fn chat_for_region(
                 axum::http::HeaderMap::new(),
                 hop_body.clone(),
                 None,
+                match protocol {
+                    Protocol::OpenAi => crate::routes::cross::CrossProtocol::OpenAi,
+                    Protocol::Anthropic => crate::routes::cross::CrossProtocol::Anthropic,
+                    Protocol::Responses => crate::routes::cross::CrossProtocol::Responses,
+                },
             ))
             .await
         } else {

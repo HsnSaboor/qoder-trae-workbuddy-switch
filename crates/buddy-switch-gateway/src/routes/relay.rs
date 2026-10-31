@@ -531,6 +531,9 @@ async fn relay_hops(
                     axum::http::HeaderMap::new(),
                     axum::body::Bytes::from(hop_body_bytes),
                     None,
+                    // ★ 能走到这里 ⇒ 入口一定是 OpenAI 形态（上面 `openai_shape` 已挡掉
+                    //   另外两种）：`prepared_body` 在此处已是 OpenAI chat 形态。
+                    crate::routes::cross::CrossProtocol::OpenAi,
                 ))
                 .await;
 

@@ -7,16 +7,33 @@
 //!
 //! ## 为什么能直接调各产品线的入口函数
 //!
-//! 四条产品线在**同一进程**里（`shared_state()` 是进程级单例），且它们的入站/出站
-//! 都是 **OpenAI 形态**（`/v1/chat/completions` 进、OpenAI SSE 出）。
-//! 所以跨平台降级在协议层不需要任何转换。
+//! 四条产品线在**同一进程**里（`shared_state()` 是进程级单例），且**每条产品线都
+//! 已经实现了三种协议入口**（chat / messages / responses）。所以跨平台降级只需要
+//! 「把请求交给目标产品线**同协议**的那个入口」，协议转换仍由目标入口自己做。
 //!
-//! ## 两条刻意的限制
+//! ## 2026-10-31 的真机事故：协议被写死成 OpenAI
 //!
-//! 1. **只支持 OpenAI 形态的入口**（`/v1/chat/completions`）。Anthropic / Responses
-//!    入口跨平台需要**反向**流式转换（目标平台只吐 OpenAI SSE），那是另一件事。
-//! 2. **不把调用方的 Key 带过去**（`key: None`）。配额与白名单在**入口**已经判过一次，
-//!    再判一次会让一次降级消耗两份配额；而目标平台的账本按它自己的账号记，与入口 Key 无关。
+//! 旧实现无论入口是什么协议，都只调目标产品线的 **`/v1/chat/completions`** 入口。
+//! 于是一个 `/v1/messages`（Anthropic）请求跨作用域降级后，客户端收到的是
+//! **HTTP 200 + OpenAI `chat.completion` 正文**：
+//!
+//! ```text
+//! API Error: API returned an empty or malformed response (HTTP 200)
+//!   — body is JSON but not a Message, 2135 bytes
+//! ```
+//!
+//! 流式更糟：Anthropic 客户端只认 `message_start` / `content_block_*`，收到
+//! `data: {"choices":…}` 会解析失败，表现成「只收到 1 个流事件就没了」。
+//! 真机复现（`qoder-global:dfmodel` 排队 → 降级到 `wb-global`）见
+//! `docs/specs/MODEL-FALLBACK.md`「跨作用域」一节。
+//!
+//! 因此本模块现在**按入口协议分派**（见 [`CrossProtocol`]），并把这一条写进契约：
+//! 目标产品线收到什么协议，就返回什么协议。
+//!
+//! ## 一条刻意的限制
+//!
+//! **不把调用方的 Key 带过去**（`key: None`）。配额与白名单在**入口**已经判过一次，
+//! 再判一次会让一次降级消耗两份配额；而目标平台的账本按它自己的账号记，与入口 Key 无关。
 //!
 //! ## 判据的代价（必须知道）
 //!
@@ -59,14 +76,32 @@ pub fn cross_depth() -> u8 {
     CROSS_DEPTH.try_with(|depth| *depth).unwrap_or(0)
 }
 
+/// 入口协议 —— 决定**目标产品线用哪个入口**，从而决定回来的响应形状。
+///
+/// 目标产品线的三条入口各自完成「入站转换 + 出站转换」，所以只要选对入口，
+/// 协议就天然一致，本模块**不需要**再做任何流式/非流式的反向转换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossProtocol {
+    /// `/v1/chat/completions`：OpenAI chat 形态（SSE 与 JSON 都是）。
+    OpenAi,
+    /// `/v1/messages`：Anthropic 形态。
+    Anthropic,
+    /// `/v1/responses`：OpenAI Responses API。
+    Responses,
+}
+
 /// 把请求交给 `target` 作用域对应的产品线，返回它的响应。
 ///
 /// 调用方负责判断响应是否成功（以及是否继续降级）。
+///
+/// `protocol` **必须**是入口协议：给错了，客户端会收到 HTTP 200 + 另一种协议的正文
+/// （真机事故见模块文档）。
 pub async fn relay_on_scope(
     target: Scope,
     headers: HeaderMap,
     body: Bytes,
     key: Option<Arc<crate::apikey::KeyActor>>,
+    protocol: CrossProtocol,
 ) -> Response {
     // ★ 限深：已经跨出去过一次的请求，目标平台内部**不许再跨**。
     //   没有这一条，`A → B → A` 会一直递归下去（编译器只挡得住「future 大小」，
@@ -76,7 +111,10 @@ pub async fn relay_on_scope(
         return depth_exceeded(target);
     }
     CROSS_DEPTH
-        .scope(depth + 1, relay_on_scope_inner(target, headers, body, key))
+        .scope(
+            depth + 1,
+            relay_on_scope_inner(target, headers, body, key, protocol),
+        )
         .await
 }
 
@@ -85,26 +123,48 @@ async fn relay_on_scope_inner(
     headers: HeaderMap,
     body: Bytes,
     key: Option<Arc<crate::apikey::KeyActor>>,
+    protocol: CrossProtocol,
 ) -> Response {
     match target.product() {
         Product::Workbuddy => {
             let state = <crate::WbGateway as crate::GatewayProduct>::shared_state();
-            crate::routes::chat::chat_for_region(
-                state,
-                crate::model_fallback::region_of(target),
-                headers,
-                body,
-                crate::routes::chat::PrefixPolicy::AlreadyResolved,
-                key,
-            )
-            .await
+            let region = crate::model_fallback::region_of(target);
+            let policy = crate::routes::chat::PrefixPolicy::AlreadyResolved;
+            match protocol {
+                CrossProtocol::OpenAi => {
+                    crate::routes::chat::chat_for_region(state, region, headers, body, policy, key)
+                        .await
+                }
+                CrossProtocol::Anthropic => {
+                    crate::routes::messages::messages_for_region(
+                        state, region, headers, body, policy, key,
+                    )
+                    .await
+                }
+                CrossProtocol::Responses => {
+                    crate::routes::responses::responses_for_region(
+                        state, region, headers, body, policy, key,
+                    )
+                    .await
+                }
+            }
         }
         Product::Trae => {
             let Some(variant) = trae_variant_of(target) else {
                 return unsupported(target);
             };
             let state = <crate::trae::TraeGateway as crate::GatewayProduct>::shared_state();
-            crate::trae::routes::chat_for_variant(state, variant, body, key).await
+            match protocol {
+                CrossProtocol::OpenAi => {
+                    crate::trae::routes::chat_for_variant(state, variant, body, key).await
+                }
+                CrossProtocol::Anthropic => {
+                    crate::trae::routes::messages_for_variant(state, variant, body, key).await
+                }
+                CrossProtocol::Responses => {
+                    crate::trae::routes::responses_for_variant(state, variant, body, key).await
+                }
+            }
         }
         Product::Qoder => {
             let state = <crate::qoder::QoderGateway as crate::GatewayProduct>::shared_state();
@@ -112,11 +172,23 @@ async fn relay_on_scope_inner(
                 state,
                 qoder_region_of(target),
                 body,
-                crate::qoder::routes::Protocol::OpenAi,
+                qoder_protocol_of(protocol),
                 key,
             )
             .await
         }
+    }
+}
+
+/// 跨作用域协议 → Qoder 产品线的协议枚举。
+///
+/// 单独抽成函数只为一件事：让「一一对应」这条映射**可被单测钉住**
+/// （见本模块 `every_cross_protocol_maps_to_its_own_upstream_protocol`）。
+fn qoder_protocol_of(protocol: CrossProtocol) -> crate::qoder::routes::Protocol {
+    match protocol {
+        CrossProtocol::OpenAi => crate::qoder::routes::Protocol::OpenAi,
+        CrossProtocol::Anthropic => crate::qoder::routes::Protocol::Anthropic,
+        CrossProtocol::Responses => crate::qoder::routes::Protocol::Responses,
     }
 }
 
@@ -193,4 +265,51 @@ fn unsupported(target: Scope) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 入口协议必须**原样**传到目标产品线 —— 这是 2026-10-31 真机事故的回归钉。
+    ///
+    /// 事故形态：`/v1/messages`（Anthropic）请求在 `qoder-global:dfmodel` 排队后跨作用域
+    /// 降级到 `wb-global`，而旧实现**只调目标产品线的 chat 入口**，于是客户端收到
+    /// `HTTP 200` + `{"object":"chat.completion",…}`：
+    ///
+    /// ```text
+    /// API Error: API returned an empty or malformed response (HTTP 200)
+    ///   — body is JSON but not a Message
+    /// ```
+    ///
+    /// 可证伪：把 `relay_on_scope_inner` 里任一 `CrossProtocol::*` 分支改成常量
+    /// （例如 Anthropic 也走 chat），本用例**不会**直接变红（它只校验映射表），
+    /// 所以这里同时钉住「映射表覆盖全部协议」—— 少一个分支会编译失败（`match` 穷尽性），
+    /// 而把分支接错则靠下面 `qoder_protocol_of` 的逐项断言。
+    #[test]
+    fn every_cross_protocol_maps_to_its_own_upstream_protocol() {
+        use crate::qoder::routes::Protocol;
+
+        // Qoder 侧：三种协议一一对应（这条映射错位 ⇒ 出站形状错）。
+        for (cross, expected) in [
+            (CrossProtocol::OpenAi, Protocol::OpenAi),
+            (CrossProtocol::Anthropic, Protocol::Anthropic),
+            (CrossProtocol::Responses, Protocol::Responses),
+        ] {
+            assert_eq!(
+                qoder_protocol_of(cross),
+                expected,
+                "跨作用域协议 {cross:?} 必须映射到 Qoder 的同名协议"
+            );
+        }
+    }
+
+    /// Anthropic 与 Responses **不是** OpenAI —— 这三者混用的后果各不相同，
+    /// 所以不能靠「反正都是 JSON」糊过去。
+    #[test]
+    fn cross_protocols_are_distinct() {
+        assert_ne!(CrossProtocol::Anthropic, CrossProtocol::OpenAi);
+        assert_ne!(CrossProtocol::Responses, CrossProtocol::OpenAi);
+        assert_ne!(CrossProtocol::Responses, CrossProtocol::Anthropic);
+    }
 }
