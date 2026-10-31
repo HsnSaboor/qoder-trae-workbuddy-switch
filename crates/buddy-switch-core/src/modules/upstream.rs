@@ -146,7 +146,56 @@ pub fn prepare_chat_body(source: &str) -> String {
     obj.insert("stream".to_string(), json!(true));
     normalize_developer_role(obj);
     normalize_tool_choice(obj);
+    neutralize_history_markers(obj);
     serde_json::to_string(&body).unwrap_or_else(|_| source.to_string())
+}
+
+/// 把历史里残留的**旧省略文案**中和掉（Qoder 专用标记，但共享出站路径一律清理）。
+///
+/// 为什么共享路径也要做：同一个客户端可能今天走 Qoder、明天走 WB/Trae，
+/// 而历史由客户端保存 —— 旧标记会跟着历史进到任何一家上游。只改 Qoder 常量
+/// 救不了这些会话；出站前统一替换，旧会话立刻止血（幂等）。
+///
+/// 只处理 `content` 的字符串 / parts 文本；其余字段（工具参数里的 JSON）不动。
+fn neutralize_history_markers(obj: &mut Map<String, Value>) {
+    let Some(Value::Array(messages)) = obj.get_mut("messages") else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        let Some(wrapped) = message.as_object_mut() else {
+            continue;
+        };
+        match wrapped.get_mut("content") {
+            Some(Value::String(text)) => {
+                if text.contains("buddy-switch:") {
+                    *text = crate::modules::qoder::api::neutralize_omitted_markers(text);
+                }
+            }
+            Some(Value::Array(parts)) => {
+                for part in parts.iter_mut() {
+                    match part {
+                        Value::String(text) => {
+                            if text.contains("buddy-switch:") {
+                                *text =
+                                    crate::modules::qoder::api::neutralize_omitted_markers(text);
+                            }
+                        }
+                        Value::Object(object) => {
+                            if let Some(Value::String(text)) = object.get_mut("text") {
+                                if text.contains("buddy-switch:") {
+                                    *text = crate::modules::qoder::api::neutralize_omitted_markers(
+                                        text,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `role: "developer"` → `role: "system"`。
@@ -1243,6 +1292,35 @@ mod tests {
     fn prepare_chat_body_passthrough_non_json() {
         assert_eq!(prepare_chat_body("not json"), "not json");
         assert_eq!(prepare_chat_body("[1,2,3]"), "[1,2,3]");
+    }
+
+    /// 旧省略标记会跟着客户端历史进入任何一家上游：共享出站路径必须中和。
+    #[test]
+    fn prepare_chat_body_neutralizes_legacy_omission_markers() {
+        let legacy = "[[buddy-switch: 已省略中间内容；需要完整内容请重新执行该命令]]";
+        let source = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": format!("之前\n{legacy}\n之后")},
+                {"role": "user", "content": [
+                    {"type": "text", "text": format!("<buddy-switch: 已接入，稍后继续。")},
+                    {"type": "image_url", "image_url": {"url": "https://x/1.png"}},
+                ]},
+            ],
+        })
+        .to_string();
+        let prepared: Value = serde_json::from_str(&prepare_chat_body(&source)).unwrap();
+        let first = prepared["messages"][0]["content"].as_str().unwrap();
+        assert!(!first.contains("重新执行"), "{first}");
+        assert!(first.contains("历史结果，无需重跑"), "{first}");
+        let second = prepared["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(!second.contains("稍后继续"), "{second}");
+        // 图片 part 不受影响。
+        assert_eq!(
+            prepared["messages"][1]["content"][1]["image_url"]["url"],
+            "https://x/1.png"
+        );
     }
 
     #[test]

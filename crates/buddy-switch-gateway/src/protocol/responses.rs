@@ -1280,7 +1280,11 @@ impl<S> ResponsesSseStream<S> {
             Some("stop") => self.tool_calls.is_empty(),
             _ => self.tool_calls.is_empty(),
         };
-        let msg_status = if is_truncated { "incomplete" } else { "completed" };
+        let msg_status = if is_truncated {
+            "incomplete"
+        } else {
+            "completed"
+        };
 
         if self.message_open {
             let id = self.message_id.clone();
@@ -1460,7 +1464,11 @@ impl<S> ResponsesSseStream<S> {
             output.push(emitted);
         }
 
-        let mut response = self.response_skeleton(if is_truncated { "incomplete" } else { "completed" });
+        let mut response = self.response_skeleton(if is_truncated {
+            "incomplete"
+        } else {
+            "completed"
+        });
         if let Some(object) = response.as_object_mut() {
             object.insert("output".to_string(), Value::Array(output));
             object.insert(
@@ -2209,9 +2217,11 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 50}
         });
-        let input = vec![chunk(&format!("data: {payload}
+        let input = vec![chunk(&format!(
+            "data: {payload}
 
-"))];
+"
+        ))];
         let stream = ResponsesSseStream::new(
             futures_util::stream::iter(input),
             "deepseek-v4.1-flash".to_string(),
@@ -2242,9 +2252,11 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 20}
         });
-        let input = vec![chunk(&format!("data: {payload}
+        let input = vec![chunk(&format!(
+            "data: {payload}
 
-"))];
+"
+        ))];
         let stream = ResponsesSseStream::new(
             futures_util::stream::iter(input),
             "deepseek-v4.1-flash".to_string(),
@@ -2273,9 +2285,11 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let input = vec![chunk(&format!("data: {payload}
+        let input = vec![chunk(&format!(
+            "data: {payload}
 
-"))];
+"
+        ))];
         let stream = ResponsesSseStream::new(
             futures_util::stream::iter(input),
             "deepseek-v4.1-flash".to_string(),

@@ -20,7 +20,6 @@ pub mod prompt;
 pub mod sanitize;
 pub mod thinking;
 
-use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -213,76 +212,102 @@ fn cleanup_orphan_tool_calls(obj: &mut Map<String, Value>) {
         return;
     };
 
-    let mut call_ids: HashSet<String> = HashSet::new();
-    let mut result_ids: HashSet<String> = HashSet::new();
+    /* ★ 上游（WorkBuddy）校验的是**序列**，不只是「id 有没有配对」：
+    每条 `assistant.tool_calls` 必须**紧邻**、且 id **逐个同序**对应若干 `role:"tool"`
+    消息；任何悬空的 `role:"tool"`、任何把两者隔开的其它消息，整单被拒
+    `400 {"code":11148,"msg":"tool calls and tool results do not match"}`。
+
+    2026-10-31 真机事故（noorulemaan3456 / `/v1/responses`）暴露了旧实现只做
+    「取交集再过滤」的四个漏洞，全部在这一处收口：
+
+    | 入站形状 | 旧结果 | 原因 |
+    |:--|:--|:--|
+    | 调用与结果之间夹了一条 user/assistant 文本 | 不相邻 | 旧实现只删不搬 |
+    | 两个并行调用的结果**乱序**回来 | id 顺序不符 | 旧实现保留原序 |
+    | 同一个 call_id 有**重复**结果 | 结果多一条 | 交集去重，但消息没去重 |
+    | 结果所属的调用已被裁掉 | 悬空 tool | 旧实现已处理（保留此行为） |
+
+    因此改成**重建**：按 assistant 批次重新发出「调用 + 紧随其后的结果」，
+    结果按 `tool_calls` 的顺序排列，重复的只取第一条；其余 tool 消息一律丢弃。
+    顺序即上游要求的顺序，不再依赖入站顺序恰好正确。 */
+
+    // 每个 tool_call_id → 第一条对应的工具结果消息（重复的后续条目丢弃）。
+    let mut results: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     for message in messages.iter() {
         let Some(wrapped) = message.as_object() else {
             continue;
         };
-        if wrapped.get("role").and_then(Value::as_str) == Some("tool") {
-            if let Some(id) = wrapped.get("tool_call_id").and_then(Value::as_str) {
-                result_ids.insert(id.to_string());
-            }
+        if wrapped.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
         }
-        if let Some(calls) = wrapped.get("tool_calls").and_then(Value::as_array) {
-            for call in calls {
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    call_ids.insert(id.to_string());
-                }
-            }
-        }
+        let Some(id) = wrapped.get("tool_call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        results.entry(id.to_string()).or_insert_with(|| message.clone());
     }
-    if call_ids.is_empty() && result_ids.is_empty() {
+
+    if !messages.iter().any(|message| {
+        message
+            .as_object()
+            .and_then(|wrapped| wrapped.get("tool_calls"))
+            .is_some()
+    }) && results.is_empty()
+    {
         return;
     }
 
-    let keep: HashSet<String> = call_ids.intersection(&result_ids).cloned().collect();
-
-    // 第一趟：裁决每个 assistant 批次，并记录真正存活下来的 tool_call id。
-    let mut surviving: HashSet<String> = HashSet::new();
-    for message in messages.iter_mut() {
-        let Some(wrapped) = message.as_object_mut() else {
+    let mut rebuilt: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages.iter() {
+        let Some(wrapped) = message.as_object() else {
+            rebuilt.push(message.clone());
             continue;
         };
-        let batch: Vec<String> = wrapped
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .map(|calls| {
-                calls
-                    .iter()
-                    .map(|call| {
-                        call.get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if batch.is_empty() {
+        let role = wrapped.get("role").and_then(Value::as_str).unwrap_or("");
+
+        // 工具结果只经由上面的批次重发；到这里的都是悬空 / 重复的，丢弃。
+        if role == "tool" {
             continue;
         }
-        if batch.iter().any(|id| !keep.contains(id)) {
-            wrapped.remove("tool_calls");
-        } else {
-            surviving.extend(batch);
+
+        let Some(calls) = wrapped.get("tool_calls").and_then(Value::as_array) else {
+            rebuilt.push(message.clone());
+            continue;
+        };
+
+        let ids: Vec<String> = calls
+            .iter()
+            .map(|call| {
+                call.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+
+        // 整批要么全有结果、要么整批删（半批会留下悬空结果，见 `partially_orphan` 用例）。
+        let complete = !ids.is_empty() && ids.iter().all(|id| results.contains_key(id));
+        if !complete {
+            let mut stripped = wrapped.clone();
+            stripped.remove("tool_calls");
+            // `content: null` + 无 tool_calls 的 assistant 同样会被上游挑刺；
+            // 清空调用后给它一个空正文，保持「一条普通 assistant 消息」的合法形状。
+            if stripped.get("content").map(Value::is_null).unwrap_or(false) {
+                stripped.insert("content".to_string(), Value::String(String::new()));
+            }
+            rebuilt.push(Value::Object(stripped));
+            continue;
+        }
+
+        rebuilt.push(message.clone());
+        // 结果按**调用顺序**紧跟其后 —— 上游按这个顺序逐个比对 id。
+        for id in &ids {
+            if let Some(result) = results.remove(id) {
+                rebuilt.push(result);
+            }
         }
     }
 
-    // 第二趟：工具结果只认存活批次。
-    messages.retain(|message| {
-        let Some(wrapped) = message.as_object() else {
-            return true;
-        };
-        if wrapped.get("role").and_then(Value::as_str) != Some("tool") {
-            return true;
-        }
-        let id = wrapped
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        surviving.contains(id)
-    });
+    *messages = rebuilt;
 }
 
 /// 注入 `prompt_cache_key`（请求体已有非空值时不动）。
