@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde_json::{json, Value};
 
+use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 use buddy_switch_core::modules::trae::{account, credits, device};
 use buddy_switch_core::modules::upstream::SESSION_DEAD_MARKERS;
@@ -172,7 +173,7 @@ pub fn classify_solo(code: i64, message: &str) -> TraeErrKind {
         return TraeErrKind::SessionDead;
     }
     let lower = message.to_lowercase();
-    if code == 1005 || lower.contains("plan") {
+    if code == 1005 || lower.contains("plan") || lower.contains("exceeded the quota") {
         return TraeErrKind::PlanLimit;
     }
     // 模型配置为空是**模型**问题而非账号问题，冷却账号没有意义。
@@ -403,8 +404,16 @@ impl TraePool {
                     } else {
                         raw.name.clone()
                     },
-                    credits: remaining.credits.get(&uid).copied(),
-                    credits_expire_at: remaining.expire_times.get(&uid).copied(),
+                    credits: if variant.region() == TraeRegion::Global {
+                        None
+                    } else {
+                        remaining.credits.get(&uid).copied()
+                    },
+                    credits_expire_at: if variant.region() == TraeRegion::Global {
+                        None
+                    } else {
+                        remaining.expire_times.get(&uid).copied()
+                    },
                     disabled: cooldown
                         .map(|entry| entry.error_type == "SessionDead")
                         .unwrap_or(false),

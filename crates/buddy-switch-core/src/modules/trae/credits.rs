@@ -21,6 +21,7 @@ use crate::modules::trae::device::DeviceEntry;
 use crate::modules::trae::jwt;
 use crate::modules::trae::paths;
 use crate::modules::trae::store;
+use crate::modules::trae::region::TraeRegion;
 use crate::modules::trae::variant::TraeVariant;
 use crate::modules::trae::{TRAE_APP_VERSION, TRAE_ENTITLEMENT_PATH};
 
@@ -937,6 +938,9 @@ pub async fn refresh_remaining_for_variant(
     variant: TraeVariant,
     user_id: &str,
 ) -> Result<f64, String> {
+    if variant.region() == TraeRegion::Global {
+        return Ok(0.0);
+    }
     let account = crate::modules::trae::account::find_for(variant, user_id).ok_or("账号不存在")?;
     let (credits, expire_at, _purchased, packages) = calc_remaining_credits(&account.jwt).await?;
     let mut remaining = load_remaining_for(variant);
@@ -965,6 +969,9 @@ pub async fn refresh_all_remaining() -> usize {
 /// 「账号库变没变」的推断（后者已被 WorkBuddy 侧论证为不可靠）。
 /// issue #108 §P0-C：排除 `SessionDead` 会让永久记录没有任何自愈路径。
 pub async fn refresh_all_remaining_for(variant: TraeVariant) -> usize {
+    if variant.region() == TraeRegion::Global {
+        return 0;
+    }
     let accounts = crate::modules::trae::account::entries_for(variant);
     let mut remaining = load_remaining_for(variant);
     let mut cooldowns = load_cooldowns_for(variant);
