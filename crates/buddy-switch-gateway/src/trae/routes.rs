@@ -46,7 +46,7 @@ use super::payload;
 use super::pool::{classify_http, classify_solo, PickedTraeAccount, TraeErrKind, TraePool};
 use super::sse::{self, TokenUsage};
 use super::{
-    now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE,
+    now_secs, TraeGatewayState, TRAE_AGENT_HOST, TRAE_APP_ID, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE,
     TRAE_LLM_CHAT_PATH,
 };
 
@@ -1544,7 +1544,7 @@ pub(crate) async fn chat_once_for_account(
     if let Some(capture) = capture {
         capture.request_pair(body, &converted);
     }
-    send_llm_chat(state, account, &converted, capture).await
+    send_llm_chat(state, account, variant, &converted, capture).await
 }
 
 /// 发一次 `llm_utils_chat`：拿到响应头即返回，不读 body。
@@ -1559,11 +1559,29 @@ pub(crate) async fn chat_once_for_account(
 async fn send_llm_chat(
     state: &TraeGatewayState,
     account: &PickedTraeAccount,
+    variant: TraeVariant,
     body: &[u8],
     capture: Option<&Capture>,
 ) -> Result<reqwest::Response, (u16, String)> {
-    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream);
+    let host = if state.upstream == TRAE_AGENT_HOST && variant.region() == TraeRegion::Global {
+        buddy_switch_core::modules::trae::endpoints_for(variant).agent_host
+    } else {
+        &state.upstream
+    };
+    let url = format!("{}{TRAE_LLM_CHAT_PATH}", host);
     let trace_id = trace_id();
+
+    let jwt_auth = if account.jwt.starts_with("Cloud-IDE-JWT ") {
+        account.jwt.clone()
+    } else {
+        format!("Cloud-IDE-JWT {}", account.jwt)
+    };
+
+    let package_type = if variant.region() == TraeRegion::Global {
+        "stable_i18n"
+    } else {
+        "stable_cn"
+    };
 
     let response = state
         .http
@@ -1573,6 +1591,7 @@ async fn send_llm_chat(
         .header(header::ACCEPT_ENCODING, "identity")
         .header(header::USER_AGENT, TRAE_USER_AGENT)
         .header(header::REFERER, &url)
+        .header(header::AUTHORIZATION, jwt_auth)
         .header("x-ide-token", &account.jwt)
         .header("x-app-id", TRAE_APP_ID)
         .header("x-app-version", "default")
@@ -1587,7 +1606,7 @@ async fn send_llm_chat(
         .header("x-machine-id", &account.machine_id)
         .header("x-os-version", "Windows 11 Home China")
         .header("request-traffic-type", "prod")
-        .header("package-type", "stable_cn")
+        .header("package-type", package_type)
         .header("x-lgw-req-sdk-type", "3")
         .header("x-lscbd-aid", "787976")
         .header("x-lscbd-platform", "windows")
@@ -2414,7 +2433,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded, None).await {
+            match send_llm_chat(&state, &picked, TraeVariant::TraeWork, &encoded, None).await {
                 Ok(mut response) => {
                     // 累积若干块，直到看见 `event:metadata`（上游认了）或 `event:error`（上游拒了）。
                     // ⚠️ 只看**首块**会把 `event:progress_notice`（排队中）误判成结论 —— 踩过。
@@ -2521,7 +2540,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded, None).await {
+            match send_llm_chat(&state, &picked, TraeVariant::TraeWork, &encoded, None).await {
                 Ok(mut response) => {
                     let mut buffer = String::new();
                     let mut verdict = "超时".to_string();

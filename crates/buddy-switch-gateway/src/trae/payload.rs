@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 
 use buddy_switch_core::modules::product::scope_of_trae_region;
 use buddy_switch_core::modules::trae::model_list::ClientModelList;
+use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 
 use super::{
@@ -604,7 +605,19 @@ pub fn prepare_llm_chat_body(
     object.insert("ide_version".into(), json!(TRAE_IDE_VERSION));
     object.insert("ide_version_code".into(), json!(TRAE_IDE_VERSION_CODE));
     object.insert("app_id".into(), json!(TRAE_APP_ID));
-    object.insert("package_type".into(), json!("stable_cn"));
+    let package_type = if variant.region() == TraeRegion::Global {
+        "stable_i18n"
+    } else {
+        "stable_cn"
+    };
+    object.insert("package_type".into(), json!(package_type));
+    if let Some(code_val) = object.get("app_version_code") {
+        if let Some(s) = code_val.as_str() {
+            if let Ok(num) = s.parse::<i64>() {
+                object.insert("app_version_code".into(), json!(num));
+            }
+        }
+    }
     if max_mode {
         object.insert("is_max_mode".into(), json!(true));
     }
@@ -1470,6 +1483,30 @@ mod tests {
         // 客户端清单里没有 `config_name` 字段 ⇒ 只能派生，派生结果必须原样是模型名。
         assert_eq!(out["config_name"], "glm-5.3-flash");
         assert_eq!(out["model_name"], "glm-5.3-flash__dev");
+    }
+
+    #[test]
+    fn global_variant_sets_package_type_and_normalizes_version_code() {
+        let bytes = serde_json::to_vec(&json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": "ping"}],
+            "app_version_code": "20260811"
+        }))
+        .unwrap();
+
+        let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            &bytes,
+            TraeVariant::Global,
+            "deepseek-v4.1-flash",
+            "u1",
+            "dev1",
+            "mach1",
+            true,
+        ))
+        .unwrap();
+
+        assert_eq!(out["package_type"], "stable_i18n");
+        assert_eq!(out["app_version_code"], 20260811i64);
     }
 
     /// ★★ 护栏：`/v1/models` **只列本 function 分组里的模型**。
