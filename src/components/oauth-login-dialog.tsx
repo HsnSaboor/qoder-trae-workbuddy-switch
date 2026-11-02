@@ -22,10 +22,12 @@ interface Props {
   onOpenChange: (open: boolean) => void;
   /** 目标版本；缺省为国内版。 */
   region?: Region;
+  /** 登录采集入库成功后的回调。 */
+  onSuccess?: (account: AccountMeta) => void;
 }
 
 /** OAuth 扫码登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
-export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
+export function OAuthLoginDialog({ open, onOpenChange, region, onSuccess }: Props) {
   const t = useT();
   const reconcileAccounts = useAccountsStore((s) => s.reconcileAccounts);
 
@@ -61,7 +63,10 @@ export function OAuthLoginDialog({ open, onOpenChange, region }: Props) {
         if (res.done) {
           if (res.result) {
             await reconcileAccounts(region);
-            if (!cancelled) setResult(res.result);
+            if (!cancelled) {
+              setResult(res.result);
+              onSuccess?.(res.result);
+            }
           } else if (!cancelled) {
             setError(res.error || t("wbAccounts.dialog.oauthLoginFail"));
           }

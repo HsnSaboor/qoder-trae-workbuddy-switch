@@ -385,7 +385,7 @@ pool/pick.rs
 | 位置 | 改动 |
 |:--|:--|
 | `PoolSummary` | 加 `excluded: usize` —— **归入互斥五态（成为第六态），不是正交计数** |
-| `status_list` / `accounts_view` | 每行加 `excluded: bool`、`excludedNote?: string` |
+| `status_list` / `accounts_view` | 每行加 `excluded: bool`、`excludedNote?: string`；`disabled` 行细分 `disabledKind: "account_restricted" | "session_dead"` |
 | `diagnose` | 输出「已排除（用户设置）」；**判定顺序：排除 > 禁用 > 冷却 > 零积分**（用户意图最该先说明） |
 | `no_credential` | 新增 cause 档 `AllExcluded { total, excluded }`，文案给「去账号池取消排除」而不是「去登录」 |
 
@@ -418,6 +418,8 @@ POST /api/gateway/pool/exclusions
 5. **冲突提示**：把当前 pinned 的号排除时，弹确认「将同时取消指定」。
 6. **说明文案**（`shared.gateway.pool.excludeHint`）：
    > 排除后网关**不会**用它（包括兜底与指定），但它仍可在桌面端正常使用。适合「留额度给客户端自己用」这类场景。
+7. **封禁与重新登录**：11140 封禁账号展示 Badge「上游封禁」，并提供直达「重新登录」按钮；完成 OAuth 登录后自动调用 revive 解除禁用。
+8. **今日用量预警**：展示单账号今日 Token 消耗，达到 40M 预警阈值时标黄警告，提示防范风控。
 
 ### 4.7 测试清单
 

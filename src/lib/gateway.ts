@@ -8,12 +8,35 @@
 
 import { t } from "@/lib/i18n";
 import type {
+  AccountTokenTodayEntry,
   GatewayConfig,
   GatewayPoolAccount,
   GatewayPoolSummary,
   GatewayStatus,
   Region,
 } from "@/lib/types";
+
+/**
+ * 账号池单日 Token 预警阈值（40M tokens/day）。
+ *
+ * 依据：实测 4 个账号单日吞吐累计 ~325M tokens（约 ~80M/号/日）触发上游风控封禁（11140）。
+ * 设置为 40M（约观察到的单号风控日均用量的一半）进行高用量预警，
+ * 提醒用户合理分摊用量或降频，防范触发上游硬封禁。
+ */
+export const POOL_TOKEN_VOLUME_WARN_THRESHOLD = 40_000_000;
+
+/** 计算账号今日全量 Token（客户端 + 网关总和）。缺席或非有效值返回 null。 */
+export function poolTodayTotalTokens(entry: AccountTokenTodayEntry | undefined | null): number | null {
+  if (!entry) return null;
+  const total = entry.clientIn + entry.clientOut + entry.gatewayIn + entry.gatewayOut;
+  return Number.isFinite(total) ? total : null;
+}
+
+/** 账号今日用量是否已达到高风险预警阈值。 */
+export function isPoolTokenVolumeHigh(entry: AccountTokenTodayEntry | undefined | null): boolean {
+  const total = poolTodayTotalTokens(entry);
+  return total !== null && total >= POOL_TOKEN_VOLUME_WARN_THRESHOLD;
+}
 
 /** 网关配置缺省值（与后端 GatewayConfig::default 对齐；字段名为 snake_case）。 */
 export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
@@ -170,6 +193,13 @@ export function normalizeGatewayPoolAccounts(raw: unknown): GatewayPoolAccount[]
         cooldownUntil: asNumber(record.cooldownUntil) ?? null,
         cooling: record.cooling === true,
         disabled: record.disabled === true,
+        disabledKind:
+          record.disabledKind === "account_restricted" ||
+          (typeof record.cooldownReason === "string" && record.cooldownReason.includes("11140"))
+            ? "account_restricted"
+            : record.disabled === true
+              ? "session_dead"
+              : null,
         // ★ 用户显式排除（互斥第六态）。**必须显式归一化**：本函数是白名单重建，
         //   漏掉一个字段就等于前端永远看不到它 —— 而「排除 / 取消排除」按钮的文案与
         //   提交值都依赖 `account.excluded`（`onExclude(uid, !account.excluded)`）。

@@ -25,7 +25,7 @@ export const en = {
   // ---- Gateway account pool status (gateway.ts — one card shared by both sides) ----
   "shared.poolStatus.available": "Available",
   "shared.poolStatus.cooling": "Cooling",
-  "shared.poolStatus.disabled": "Session expired",
+  "shared.poolStatus.disabled": "Disabled",
   "shared.poolStatus.expired": "Credits expired",
   "shared.poolStatus.noCredits": "No credits",
   "shared.poolStatus.excluded": "Excluded",
@@ -359,7 +359,7 @@ export const en = {
   "shared.gateway.pool.tile.availableBusyHint":
     "These accounts are healthy; they are just at their concurrency cap because earlier requests are still running. They recover on their own in seconds — nothing to do.",
   "shared.gateway.pool.tile.cooling": "Cooling",
-  "shared.gateway.pool.tile.disabled": "Session dead",
+  "shared.gateway.pool.tile.disabled": "Disabled",
   "shared.gateway.pool.tile.expired": "Credits expired",
   "shared.gateway.pool.tile.zeroCredits": "No credits",
   "shared.gateway.pool.tile.excluded": "Excluded",
@@ -426,6 +426,15 @@ export const en = {
   "shared.gateway.pool.excludeFail": "Failed to exclude",
   "shared.gateway.pool.excludeHint": "Exclude = the gateway will never use this account (auto-pick, fallback, stickiness and pinning all skip it). It is NOT a disable - the account keeps working in the desktop client. Useful for reserving quota for your own use.",
   "shared.gateway.pool.reviveHint": "A disabled account never recovers on its own — Restore clears the disable and the cooldown at once so it rejoins rotation. If it is still unusable it will be disabled again.",
+  "shared.gateway.pool.statusRestricted": "Restricted",
+  "shared.gateway.pool.todayTokens": "Today {tokens}",
+  "shared.gateway.pool.volumeWarnHint": "Today's volume ({tokens}) reached the per-account warning threshold ({threshold}). High daily volume may trigger upstream restriction (11140). Consider throttling or distributing across more accounts.",
+  "shared.gateway.pool.volumeWarnFooter": "Some accounts have reached the daily token volume warning threshold ({threshold}). The gateway limits per-account concurrency, but continuous high-volume requests can still trigger upstream restrictions.",
+  "shared.gateway.pool.relogin": "Re-login",
+  "shared.gateway.pool.reloginHint": "Account restricted by upstream (11140). Click to re-authenticate and restore.",
+  "shared.gateway.pool.reloginDone": "Re-login successful. Account restored in gateway rotation.",
+  "shared.gateway.pool.reloginFail": "Re-login succeeded, but failed to restore account in gateway.",
+  "shared.gateway.pool.reloginGuide": "Accounts restricted by upstream (11140) must re-authenticate to obtain a fresh session; upon success, the gateway automatically clears the disabled state.",
 
   // ---- Clipboard (clipboard.ts) ----
   "shared.clipboard.copied": "Copied",

@@ -41,7 +41,7 @@ export const zh = {
   // ⚠️ `expired` 只有 Trae 侧会产出：WorkBuddy 池不存积分有效期，没有判据就不展示。
   "shared.poolStatus.available": "可用",
   "shared.poolStatus.cooling": "冷却中",
-  "shared.poolStatus.disabled": "会话失效",
+  "shared.poolStatus.disabled": "已禁用",
   "shared.poolStatus.expired": "积分过期",
   "shared.poolStatus.noCredits": "零积分",
   "shared.poolStatus.excluded": "已排除",
@@ -397,7 +397,7 @@ export const zh = {
   "shared.gateway.pool.tile.availableBusyHint":
     "这些账号状态正常，只是并发额度占满（在途请求还没结束）；几秒后自动恢复，无需任何操作。",
   "shared.gateway.pool.tile.cooling": "冷却中",
-  "shared.gateway.pool.tile.disabled": "会话失效",
+  "shared.gateway.pool.tile.disabled": "已禁用",
   "shared.gateway.pool.tile.expired": "积分过期",
   "shared.gateway.pool.tile.zeroCredits": "零积分",
   "shared.gateway.pool.tile.excluded": "已排除",
@@ -457,6 +457,15 @@ export const zh = {
   "shared.gateway.pool.excludeFail": "排除失败",
   "shared.gateway.pool.excludeHint": "「排除」= 网关不再用这个账号（自动选号、兜底、粘性、指定全都跳过），但它**不是禁用** —— 账号本身仍可在客户端正常使用。适合「把额度留给客户端自己用」这类场景。",
   "shared.gateway.pool.reviveHint": "已禁用的账号不会自动解除——点「恢复」会立即解除禁用与冷却，让它重新参与选号；若它仍然不可用，会再次被禁用。",
+  "shared.gateway.pool.statusRestricted": "上游封禁",
+  "shared.gateway.pool.todayTokens": "今日 {tokens}",
+  "shared.gateway.pool.volumeWarnHint": "今日用量（{tokens}）已达单账号预警阈值（{threshold}）。单日吞吐过高易触发上游风控封禁（11140），建议降频或分摊到更多账号。",
+  "shared.gateway.pool.volumeWarnFooter": "部分账号今日 Token 用量已达到单日预警线（{threshold}），请留意防范上游风控。网关已限制单账号并发，但无法阻止高频累积调用。",
+  "shared.gateway.pool.relogin": "重新登录",
+  "shared.gateway.pool.reloginHint": "该账号被上游风控封禁（11140）。点击重新完成上游登录以解除限制。",
+  "shared.gateway.pool.reloginDone": "重新登录成功，已恢复该账号在网关中的可用状态",
+  "shared.gateway.pool.reloginFail": "重新登录成功，但恢复网关可用状态失败",
+  "shared.gateway.pool.reloginGuide": "被上游限制（11140）的账号必须重新完成上游登录以刷新会话；登录成功后网关会自动解除禁用。",
 
   // ---- 剪贴板（clipboard.ts） ----
   "shared.clipboard.copied": "已复制",

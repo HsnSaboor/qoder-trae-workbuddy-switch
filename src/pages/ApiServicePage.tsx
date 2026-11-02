@@ -4,6 +4,7 @@ import { AlertTriangle, Copy, FolderOpen, Loader2, Power, RefreshCw, ShieldAlert
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
+import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { ApiKeyTable } from "@/components/gateway/api-key-table";
 import {
   AccountPoolCard,
@@ -54,7 +55,7 @@ import { poolOf, resolveGatewayBaseUrl, resolveGatewayRunning } from "@/lib/gate
 import { regionDescriptor } from "@/lib/region";
 import { scopeOf } from "@/lib/scope";
 import { cn } from "@/lib/utils";
-import type { AccountStrategy, ApiKeyRecord, GatewayConfig, Region } from "@/lib/types";
+import type { AccountStrategy, AccountTokenTodayEntry, ApiKeyRecord, GatewayConfig, Region } from "@/lib/types";
 import { useRefreshAction } from "@/lib/use-refresh-action";
 import { useWorkbuddyRegion } from "@/lib/use-workbuddy-region";
 import { useGatewayStore } from "@/stores/gateway";
@@ -593,6 +594,55 @@ function RegionPoolCard({ region }: { region: Region }) {
   const [saving, setSaving] = useState(false);
   const [revivingUid, setRevivingUid] = useState<string | null>(null);
   const [excludingUid, setExcludingUid] = useState<string | null>(null);
+  const [reloginUid, setReloginUid] = useState<string | null>(null);
+  const [todayTokens, setTodayTokens] = useState<Map<string, AccountTokenTodayEntry> | null>(null);
+  const [todayTruncated, setTodayTruncated] = useState(false);
+  const [tokenReloadCount, setTokenReloadCount] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getAccountTokenToday(region)
+      .then((res) => {
+        if (cancelled) return;
+        const map = new Map<string, AccountTokenTodayEntry>();
+        for (const entry of res.accounts ?? []) {
+          if (entry.uid) {
+            map.set(entry.uid, entry);
+          }
+        }
+        setTodayTokens(map);
+        setTodayTruncated(Boolean(res.gatewayTruncated));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTodayTokens(null);
+          setTodayTruncated(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [region, tokenReloadCount]);
+
+  async function onReloginSuccess() {
+    if (!reloginUid) return;
+    const targetUid = reloginUid;
+    try {
+      const result = await api.reviveGatewayAccount(targetUid);
+      if (result.revived) {
+        toast.success(t("shared.gateway.pool.reloginDone"));
+      } else {
+        toast.info(t("shared.gateway.pool.reviveNoop"));
+      }
+    } catch (e) {
+      toast.error(t("shared.gateway.pool.reloginFail"), { description: api.asError(e) });
+    } finally {
+      setReloginUid(null);
+      await refreshStatus();
+      setTokenReloadCount((c) => c + 1);
+    }
+  }
   /* ★ issue #129：「账号故障时自动切换」是**网关级**开关（不分区域），
      所以两张区域卡显示的是同一个值、改任一张都生效。 */
   const config = useGatewayStore((s) => s.config);
@@ -706,6 +756,7 @@ function RegionPoolCard({ region }: { region: Region }) {
       );
       // 计数格与行状态都来自 `status` ⇒ 重新拉一次，否则界面还显示旧状态。
       await refreshStatus();
+      setTokenReloadCount((c) => c + 1);
     } catch (e) {
       toast.error(t("shared.gateway.pool.excludeFail"), { description: api.asError(e) });
     } finally {
@@ -725,6 +776,7 @@ function RegionPoolCard({ region }: { region: Region }) {
       }
       // 计数格与行状态都来自 `status` ⇒ 重新拉一次，否则界面还显示「已禁用」。
       await refreshStatus();
+      setTokenReloadCount((c) => c + 1);
     } catch (e) {
       toast.error(t("shared.gateway.pool.reviveFail"), { description: api.asError(e) });
     } finally {
@@ -733,32 +785,47 @@ function RegionPoolCard({ region }: { region: Region }) {
   }
 
   return (
-    <AccountPoolCard
-      pool={pool}
-      accounts={accounts}
-      diagnose={diagnose}
-      preferredUid={preferredUid}
-      onPreferredUidChange={onPreferredChange}
-      saving={saving}
-      onRevive={onRevive}
-      revivingUid={revivingUid}
-      onExclude={onExclude}
-      excludingUid={excludingUid}
-      // ★ issue #129：账号故障时自动切换（网关级，两张区域卡同源）。
-      autoFailover={config.auto_failover}
-      onAutoFailoverChange={onAutoFailoverChange}
-      failoverSaving={failoverSaving}
-      // WorkBuddy 池不存积分有效期 ⇒ 没有「积分过期」格（见卡片注释）。
-      tiles={WB_POOL_TILES}
-      autoOptions={[
-        { value: AUTO_OPTION, label: t("shared.gateway.pool.preferredAuto") },
-        { value: MAX_CREDITS_OPTION, label: t("shared.gateway.pool.strategyMaxCredits") },
-        { value: RANDOM_OPTION, label: t("shared.gateway.pool.strategyRandom") },
-        { value: SEQUENTIAL_OPTION, label: t("shared.gateway.pool.strategySequential") },
-      ]}
-      // 不传 `title`：与 Trae 侧一致用默认的「账号池」——版本由**页头切换器**承担，
-      // 卡内再挂一次版本后缀只是噪音（Trae 的池卡同样不标区域）。
-      className="mb-6"
-    />
+    <>
+      <AccountPoolCard
+        pool={pool}
+        accounts={accounts}
+        diagnose={diagnose}
+        preferredUid={preferredUid}
+        onPreferredUidChange={onPreferredChange}
+        saving={saving}
+        onRevive={onRevive}
+        revivingUid={revivingUid}
+        onExclude={onExclude}
+        excludingUid={excludingUid}
+        // ★ issue #129：账号故障时自动切换（网关级，两张区域卡同源）。
+        autoFailover={config.auto_failover}
+        onAutoFailoverChange={onAutoFailoverChange}
+        failoverSaving={failoverSaving}
+        // WorkBuddy 池不存积分有效期 ⇒ 没有「积分过期」格（见卡片注释）。
+        tiles={WB_POOL_TILES}
+        autoOptions={[
+          { value: AUTO_OPTION, label: t("shared.gateway.pool.preferredAuto") },
+          { value: MAX_CREDITS_OPTION, label: t("shared.gateway.pool.strategyMaxCredits") },
+          { value: RANDOM_OPTION, label: t("shared.gateway.pool.strategyRandom") },
+          { value: SEQUENTIAL_OPTION, label: t("shared.gateway.pool.strategySequential") },
+        ]}
+        todayTokens={todayTokens}
+        todayTokensTruncated={todayTruncated}
+        onRelogin={(uid) => setReloginUid(uid)}
+        // 不传 `title`：与 Trae 侧一致用默认的「账号池」——版本由**页头切换器**承担，
+        // 卡内再挂一次版本后缀只是噪音（Trae 的池卡同样不标区域）。
+        className="mb-6"
+      />
+      <OAuthLoginDialog
+        open={reloginUid !== null}
+        onOpenChange={(open) => {
+          if (!open) setReloginUid(null);
+        }}
+        region={region}
+        onSuccess={() => {
+          void onReloginSuccess();
+        }}
+      />
+    </>
   );
 }

@@ -1856,6 +1856,8 @@ export interface GatewayPoolAccount {
   cooldownUntil?: number | null;
   cooling?: boolean;
   disabled?: boolean;
+  /** 禁用原因细分（11140 封禁 vs 12153 会话失效）。 */
+  disabledKind?: "account_restricted" | "session_dead" | null;
   /** 仅 WorkBuddy：所属版本，前端据此把一个池拆成两张卡。 */
   realm?: Region | "unknown";
   /** 仅 Trae：积分到期时刻。 */

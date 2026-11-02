@@ -2159,6 +2159,15 @@ impl Pool {
                         .then(|| entry.reason.clone())
                         .filter(|reason| !reason.is_empty()),
                     "disabled": entry.disabled,
+                    "disabledKind": if entry.disabled {
+                        if entry.reason.contains("11140") {
+                            Some("account_restricted")
+                        } else {
+                            Some("session_dead")
+                        }
+                    } else {
+                        None
+                    },
                     // 用户显式排除（硬约束：选号 / 兜底 / 偏好都跳过）。`excludedNote` 给 UI 展示原因。
                     "excluded": exclusion.is_some(),
                     "excludedNote": exclusion
@@ -3833,10 +3842,26 @@ mod tests {
             "禁用原因（与冷却原因共用 `reason`）不得被门控藏掉"
         );
         assert_eq!(
+            object["disabledKind"],
+            json!("session_dead"),
+            "会话失效细分"
+        );
+        assert_eq!(
             object["cooldownUntil"],
             Value::Null,
             "禁用是终态，没有「解冻时刻」可给"
         );
+
+        // ★ 11140 上游封禁的账号，disabledKind 必须细分为 account_restricted
+        pool.upsert("u-ban", Some(RealmTag::Cn), "被封禁");
+        pool.apply_upstream_error("u-ban", "", &UpstreamEvent::AccountRestricted, NOW);
+        let ban_row = pool
+            .status_list(NOW)
+            .into_iter()
+            .find(|row| row["uid"] == "u-ban")
+            .expect("存在");
+        assert_eq!(ban_row["status"], json!("disabled"));
+        assert_eq!(ban_row["disabledKind"], json!("account_restricted"));
     }
 
     /// 网关 `/status` 出口（`snapshot`）同样不得复述**已到期**的冷却残留。

@@ -1,4 +1,4 @@
-import { Info, Loader2 } from "lucide-react";
+import { AlertTriangle, Info, Loader2 } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -7,9 +7,15 @@ import { DemoAction } from "@/components/demo-action";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { POOL_STATUS_LABELS } from "@/lib/gateway";
+import {
+  POOL_STATUS_LABELS,
+  POOL_TOKEN_VOLUME_WARN_THRESHOLD,
+  isPoolTokenVolumeHigh,
+  poolTodayTotalTokens,
+} from "@/lib/gateway";
+import { compactTokens } from "@/components/usage/format";
 import { useT } from "@/lib/i18n";
-import type { GatewayPoolAccount, GatewayPoolSummary } from "@/lib/types";
+import type { AccountTokenTodayEntry, GatewayPoolAccount, GatewayPoolSummary } from "@/lib/types";
 import type { TranslationKey } from "@/locales/zh";
 import { cn } from "@/lib/utils";
 
@@ -263,6 +269,9 @@ export function AccountPoolCard({
   autoFailover,
   onAutoFailoverChange,
   failoverSaving = false,
+  todayTokens = null,
+  todayTokensTruncated = false,
+  onRelogin,
   className,
 }: {
   pool: GatewayPoolSummary | null;
@@ -308,6 +317,12 @@ export function AccountPoolCard({
   onAutoFailoverChange?: (value: boolean) => void;
   /** 开关保存中（禁用，避免连点产生两次整份写入）。 */
   failoverSaving?: boolean;
+  /** 账号今日用量聚合（按 uid 映射）。 */
+  todayTokens?: Map<string, AccountTokenTodayEntry> | null;
+  /** 今日网关部分统计是否已发生日志截断（下界标记）。 */
+  todayTokensTruncated?: boolean;
+  /** 账号被上游限制（11140）时唤起重新登录的回调。 */
+  onRelogin?: (uid: string) => void;
   className?: string;
 }) {
   const t = useT();
@@ -317,6 +332,10 @@ export function AccountPoolCard({
   const preferredInPool = preferredUid !== "" && accounts.some((a) => a.uid === preferredUid);
   // 「不指定」的取值是空串，但 Radix 不吃空串 value ⇒ 用哨兵值显示。
   const selectValue = preferredUid === "" ? AUTO_OPTION : preferredUid;
+  const hasHighVolumeAccount = accounts.some((account) => {
+    const entry = todayTokens?.get(account.uid);
+    return isPoolTokenVolumeHigh(entry);
+  });
 
   return (
     <div className={cn(className)}>
@@ -489,6 +508,12 @@ export function AccountPoolCard({
               {accounts.map((account) => {
                 const meta = POOL_STATUS_LABELS[account.status];
                 const pinned = account.uid === preferredUid;
+                const isRestricted =
+                  account.disabledKind === "account_restricted" ||
+                  (account.status === "disabled" && Boolean(account.cooldownReason?.includes("11140")));
+                const todayEntry = todayTokens?.get(account.uid);
+                const todayTotal = poolTodayTotalTokens(todayEntry);
+                const isHighVolume = isPoolTokenVolumeHigh(todayEntry);
                 return (
                   <tr key={account.uid} className="border-b border-border/40 last:border-0">
                     <td className="px-5 py-2.5">
@@ -500,21 +525,48 @@ export function AccountPoolCard({
                       )}
                     </td>
                     <td className="px-2 py-2.5 text-xs text-muted-foreground tabular-nums">
-                      {t("shared.gateway.pool.credits", {
-                        credits: formatCredits(account.credits),
-                      })}
+                      <div>
+                        {t("shared.gateway.pool.credits", {
+                          credits: formatCredits(account.credits),
+                        })}
+                      </div>
+                      {todayTotal !== null && (
+                        <div
+                          className={cn(
+                            "mt-0.5 flex items-center gap-1 text-[11px]",
+                            isHighVolume ? "font-medium text-warning" : "text-muted-foreground/80",
+                          )}
+                          title={
+                            isHighVolume
+                              ? t("shared.gateway.pool.volumeWarnHint", {
+                                  tokens: `${todayTokensTruncated ? "≥" : ""}${compactTokens(todayTotal)}`,
+                                  threshold: compactTokens(POOL_TOKEN_VOLUME_WARN_THRESHOLD),
+                                })
+                              : undefined
+                          }
+                        >
+                          {isHighVolume && (
+                            <AlertTriangle className="size-3 shrink-0 text-warning" aria-hidden />
+                          )}
+                          <span>
+                            {t("shared.gateway.pool.todayTokens", {
+                              tokens: `${todayTokensTruncated ? "≥" : ""}${compactTokens(todayTotal)}`,
+                            })}
+                          </span>
+                        </div>
+                      )}
                     </td>
                     <td className="px-2 py-2.5">
                       <div className="flex flex-wrap items-center gap-2">
                         <Badge
-                          variant={meta.tone === "danger" ? "destructive" : "secondary"}
+                          variant={isRestricted ? "destructive" : meta.tone === "danger" ? "destructive" : "secondary"}
                           className={cn(
                             "shrink-0",
-                            meta.tone === "ok" && "text-success",
-                            meta.tone === "warn" && "text-warning",
+                            !isRestricted && meta.tone === "ok" && "text-success",
+                            !isRestricted && meta.tone === "warn" && "text-warning",
                           )}
                         >
-                          {meta.label}
+                          {isRestricted ? t("shared.gateway.pool.statusRestricted") : meta.label}
                         </Badge>
                         {/* ★ 只有**真的不可用**（冷却 / 禁用）时才复述原因。
                             `cooldownReason` 是墙钟到期的字段，后端已被门控（两平台的 `status_list`
@@ -535,6 +587,20 @@ export function AccountPoolCard({
                     </td>
                     <td className="px-5 py-2.5 text-right">
                       <div className="flex items-center justify-end gap-2">
+                        {onRelogin && isRestricted && (
+                          <DemoAction>
+                            <Button
+                              variant="default"
+                              size="sm"
+                              className="h-7 px-2"
+                              data-act="pool-relogin"
+                              title={t("shared.gateway.pool.reloginHint")}
+                              onClick={() => onRelogin(account.uid)}
+                            >
+                              {t("shared.gateway.pool.relogin")}
+                            </Button>
+                          </DemoAction>
+                        )}
                         {/* ★ 已禁用的账号**必须**给「恢复」出口：`disabled` 是终态且落盘持久化，
                             余额刷新救不了它（`thaw_hard_credit_if_recovered` 第一句就是
                             `if entry.disabled { return false }`）—— 没有这个按钮，该账号**永久不可用**。
@@ -626,6 +692,18 @@ export function AccountPoolCard({
         {onExclude && (
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
             {t("shared.gateway.pool.excludeHint")}
+          </p>
+        )}
+        {onRelogin && accounts.some((a) => a.disabledKind === "account_restricted" || (a.status === "disabled" && a.cooldownReason?.includes("11140"))) && (
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            {t("shared.gateway.pool.reloginGuide")}
+          </p>
+        )}
+        {hasHighVolumeAccount && (
+          <p className="mt-1 text-xs leading-5 text-warning/90">
+            {t("shared.gateway.pool.volumeWarnFooter", {
+              threshold: compactTokens(POOL_TOKEN_VOLUME_WARN_THRESHOLD),
+            })}
           </p>
         )}
       </div>

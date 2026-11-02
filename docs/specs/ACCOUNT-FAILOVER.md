@@ -117,3 +117,17 @@ Qoder 侧额外把原文放进错误帧的非标准字段 `error.upstream`（客
   （`Pool::apply_upstream_error` 的 `HardCredit` 分支返回 `false`）。
   这与 [`MODEL-FALLBACK.md`](MODEL-FALLBACK.md) 「402 不降级」**不矛盾**：
   降级是换**模型**（额度问题换模型仍 402），换号是换**账号**（别的号可能有钱）。
+
+## 九、账号被上游限制（11140）与重新登录治理
+
+1. **上游处置成因与特征**：
+   WorkBuddy 上游对账号风控以 `400`/`403` + `{"code":11140}` 返回，正文常含「request illegal」。该状态不可通过冷却自愈，必须重新登录该上游账号。
+2. **网关处理**：
+   - 识别为 `UpstreamEvent::AccountRestricted`，直接进入终态 `disabled`，写入禁用原因 `ACCOUNT_RESTRICTED_REASON`（`status_list` 产出 `disabledKind: "account_restricted"`）；
+   - 本轮请求继续换号（`stop = false`），不让池内其它正常账号连坐；
+   - 客户端收到中文可执行提示（明确说明是账号限制，换模型/Key 无效，需重新登录）。
+3. **前端呈现与恢复流**：
+   - 账号池状态徽标显示为「上游封禁」（`destructive` 强调色）；
+   - 针对 11140 限制账号直接提供「重新登录」按钮，唤起 OAuth 扫码/授权登录完成重新认证；
+   - 重新登录成功后自动调用 `reviveGatewayAccount`，解除网关禁用并重新拉取池状态；
+   - 账号池集成今日用量（40M tokens 预警阈值），对高吞吐账号标黄提醒，防范风控。
