@@ -74,7 +74,8 @@ pub fn client_error(event: &UpstreamEvent, account: &str, model: &str) -> Client
         UpstreamEvent::SoftRate { .. }
         | UpstreamEvent::HardCredit
         | UpstreamEvent::SessionDead
-        | UpstreamEvent::AuthRejected => (429u16, "rate_limit_error", "账号不可用"),
+        | UpstreamEvent::AuthRejected
+        | UpstreamEvent::AccountRestricted => (429u16, "rate_limit_error", "账号不可用"),
         UpstreamEvent::Server | UpstreamEvent::Timeout => (502u16, "api_error", "上游连接中断"),
         UpstreamEvent::ModelBlocked => (400u16, "invalid_request_error", "模型被上游拒绝"),
         UpstreamEvent::NotFound => (400u16, "invalid_request_error", "上游未找到该模型"),
@@ -240,6 +241,8 @@ mod tests {
             UpstreamEvent::HardCredit,
             UpstreamEvent::SessionDead,
             UpstreamEvent::AuthRejected,
+            // 11140 同样是「这个号不行了」，流中途换成别的号重跑仍有意义。
+            UpstreamEvent::AccountRestricted,
         ] {
             let error = client_error(&event, "一号", "hy4");
             assert_eq!(error.status, 429, "账号级失败对外统一 429：{event:?}");

@@ -528,13 +528,16 @@ fn no_credential_message(region: Region, cause: NoCredentialCause) -> String {
             } else {
                 ""
             };
+            // ★ 别再写「重新登录 / 切换账号不会解除禁用」：上游限制（11140）恰恰要
+            //   先重新登录该账号、再在账号池人工「恢复」。把不同原因的解法压成一句
+            //   无差别否定，会让用户放弃唯一有效的动作 —— 与 issue #26 同一类错误。
             format!(
                 "本机{name}账号库有 {total} 个账号，但此刻 0 个可用：\
                  {disabled} 个已禁用、{cooling} 个冷却中、{zero_credits} 个余额为 0\
                  {excluded_clause}{in_flight_clause}{model_cooling_clause}。\
-                 重新登录 / 切换账号不会解除禁用、冷却与排除 —— \
-                 请在「网关 → 账号池」查看逐账号原因（禁用是终态，需余额刷新成功或人工复活\
-                 {excluded_hint}{in_flight_hint}{model_cooling_hint}）"
+                 各状态的解法不同（上游限制需先重新登录该账号再人工「恢复」；\
+                 冷却会到期自愈）—— 请按「网关 → 账号池」里的逐账号原因处理\
+                 {excluded_hint}{in_flight_hint}{model_cooling_hint}"
             )
         }
         // ★ 名单口径（issue #76）：白名单生效时**必须**走这条，否则用户会拿着

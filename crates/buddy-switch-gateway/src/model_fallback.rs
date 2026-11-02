@@ -416,8 +416,12 @@ pub fn trigger_for(error: &GatewayError, event: Option<&UpstreamEvent>) -> Optio
         // 与 5xx 的处置不同 —— 换一个更快的模型有效，换号多半无用。
         UpstreamEvent::Timeout => Some(Trigger::Timeout),
         UpstreamEvent::NotFound => Some(Trigger::NotFound),
-        // ★ 以下**刻意不降级**（见模块文档）：HardCredit / SessionDead / AuthRejected / Client。
-        //   内容审核（11-128）落在 `Client`，也在这里被挡掉。
+        // ★ 以下**刻意不降级**（见模块文档）：HardCredit / SessionDead / AuthRejected /
+        //   AccountRestricted / Client。内容审核（11-128）落在 `Client`，也在这里被挡掉。
+        //
+        //   `AccountRestricted`（11140）虽然严重，但成因在**账号**而不是模型：网关已经
+        //   禁用该号并在本轮继续换号。把它塞进降级链会把「去重新登录」这个唯一正确的
+        //   下一步，翻译成「换了个模型继续跑」——与 AuthRejected 同一条理由。
         UpstreamEvent::HardCredit
         | UpstreamEvent::SoftRate {
             model_scoped: false,
@@ -425,6 +429,7 @@ pub fn trigger_for(error: &GatewayError, event: Option<&UpstreamEvent>) -> Optio
         }
         | UpstreamEvent::SessionDead
         | UpstreamEvent::AuthRejected
+        | UpstreamEvent::AccountRestricted
         | UpstreamEvent::Client => None,
     }
 }

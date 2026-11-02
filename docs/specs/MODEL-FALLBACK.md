@@ -193,6 +193,7 @@ pub enum Trigger {
 | **内容审核拒绝**（`11-128` / `content_blocked`） | `Client` | ❌ | **禁止** | ★ 见下方红线 |
 | **402 余额不足** | `HardCredit` | ❌ | **禁止** | 账号额度问题，换模型同样 402 |
 | **401/403 凭据被拒** | `AuthRejected` | ❌ | **禁止** | 账号问题。降级会污染目标模型，且掩盖了「该重新登录」这个真实指引 |
+| **11140 账号被上游限制** | `AccountRestricted` | ❌ | **禁止** | 与 401/403 同一条理由（成因在账号）。网关会**禁用该号**并在本轮继续换号；对外文案写明「需重新登录上游账号」 |
 | **Key 配额用尽** `KeyQuotaExceeded` | 429 | ❌ | **禁止** | 按 Key 计量，与模型无关。且它在选号前就被拒，根本进不了循环 |
 | **在途占满** `PoolBusy` | 503 | ❌ | **禁止** | 几秒自愈，等待比降级便宜 |
 
@@ -672,7 +673,7 @@ pub struct FallbackEvent {
 2. 目标被禁用 ⇒ 不出现在 plan 里。
 3. 目标与主模型同名 ⇒ 被剔除（不自环）。
 4. 环路 `A→B`、`B→A` ⇒ 单次请求内 `B` 只出现一次。
-5. `should_fallback`：402 / 400 / 审核 / `AuthRejected` 全部返回 `None`（**变异测试：把 `Client` 加进白名单，这条必须红**）。
+5. `should_fallback`：402 / 400 / 审核 / `AuthRejected` / `AccountRestricted`（11140）全部返回 `None`（**变异测试：把 `Client` 加进白名单，这条必须红**）。
 6. 未知 scope 键原样保留、不清空已知 scope（同 `disabled_models` 的脚枪测试）。
 
 `relay.rs` 集成测试：

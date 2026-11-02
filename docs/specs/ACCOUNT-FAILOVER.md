@@ -27,7 +27,7 @@
 
 | 上游事件 | 对外 `status` | 对外 `type` | 客户端归类 | 可重试 |
 |:--|:--|:--|:--|:--|
-| `SoftRate` / `HardCredit` / `SessionDead` / `AuthRejected` | 429 | `rate_limit_error` | `RATE_LIMIT` | 是 |
+| `SoftRate` / `HardCredit` / `SessionDead` / `AuthRejected` / `AccountRestricted` | 429 | `rate_limit_error` | `RATE_LIMIT` | 是 |
 | `Server` / `Timeout` / 上游断流 | 502 | `api_error` | `SERVER` | 是 |
 | `ModelBlocked` / `NotFound` / `Client` | 400 | `invalid_request_error` | `INVALID_REQUEST` | 否 |
 

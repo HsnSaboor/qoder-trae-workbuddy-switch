@@ -1215,7 +1215,11 @@ async fn relay_once(
                             error: GatewayError::Upstream {
                                 kind: upstream_kind_of(&event),
                                 status: envelope.status,
-                                message: envelope.message.clone(),
+                                message: client_facing_message(
+                                    &event,
+                                    &account_name,
+                                    &envelope.message,
+                                ),
                                 attempts: attempts.clone(),
                             },
                             account: account_name,
@@ -1305,7 +1309,9 @@ async fn relay_once(
                     error: GatewayError::Upstream {
                         kind,
                         status,
-                        message: message.clone(),
+                        // 原文仍写进 `upstream_message`（日志要 requestId 才能申诉），
+                        // 但**不**再原样丢给客户端（见 `client_facing_message`）。
+                        message: client_facing_message(&event, &account_name, &message),
                         attempts: attempts.clone(),
                     },
                     account: account_name,
@@ -1447,6 +1453,8 @@ fn should_rotate(event: &UpstreamEvent, attempt: usize) -> bool {
         // 401/403 换号能救：池里其它号的凭据可能好好的（issue #100）。
         // 旧实现把它归到 `Client`（不换号）⇒ 池里明明有健康账号，客户端却直接吃到 401。
         UpstreamEvent::AuthRejected => true,
+        // 账号被上游限制（11140）：这个号已经废了，但别的号可能完好 —— 继续换。
+        UpstreamEvent::AccountRestricted => true,
         // 只换一次（`attempt == 0` 时还允许再试一个号）。
         UpstreamEvent::NotFound => attempt == 0,
         // 调用方自己的问题，换谁都一样。
@@ -1557,8 +1565,11 @@ pub fn upstream_kind_of(
         UpstreamEvent::NotFound => UpstreamErrorKind::NotFound,
         UpstreamEvent::Server => buddy_switch_core::modules::upstream::UpstreamErrorKind::Server,
         UpstreamEvent::Timeout => UpstreamErrorKind::Timeout,
-        UpstreamEvent::ModelBlocked | UpstreamEvent::Client => {
-            buddy_switch_core::modules::upstream::UpstreamErrorKind::Client
+        // 11140 对外按 4xx 返回：这是**账号级**拒绝，但客户端手里的网关 Key 没有被拒。
+        // 用 401 会把 Claude Code 之类的客户端推进「你的 API Key 无效 / 请重新登录 Anthropic」
+        // 的错误引导，而真正要做的是去重新登录**上游账号**（文案里已写明）。
+        UpstreamEvent::ModelBlocked | UpstreamEvent::AccountRestricted | UpstreamEvent::Client => {
+            UpstreamErrorKind::Client
         }
     }
 }
@@ -1600,8 +1611,35 @@ fn describe_event(event: &UpstreamEvent) -> String {
         UpstreamEvent::AuthRejected => {
             "401/403 凭据被拒 → 浅冷却 60s 并换号（保活刷新后可自愈）".to_string()
         }
+        UpstreamEvent::AccountRestricted => {
+            "11140 账号被上游限制 → 禁用该账号并换号（需重新登录）".to_string()
+        }
         UpstreamEvent::Client => "4xx 调用方错误（不换号）".to_string(),
     }
+}
+
+/// 给**人**看的失败消息：只对「原样透传毫无用处」的那一档换文案。
+///
+/// 11140 的上游体是三段式 JSON（`code` / `requestId` / 中英繁 `displayMsg` + `displayTips`），
+/// 直接透传时客户端只显示 `API Error: 400 {"code":11140,...}` —— 用户无法判断
+/// 是账号被封、密钥失效还是模型不支持，也不知道下一步做什么。
+///
+/// 其它失败仍保留上游原文：参数错必须让用户看见是哪个字段（换成「上游拒绝了本次请求」
+/// 反而把唯一可自查的信息抹掉）。
+fn client_facing_message(event: &UpstreamEvent, account: &str, raw: &str) -> String {
+    if !matches!(event, UpstreamEvent::AccountRestricted) {
+        return raw.to_string();
+    }
+    let who = if account.is_empty() {
+        "该账号".to_string()
+    } else {
+        format!("账号「{account}」")
+    };
+    format!(
+        "{who}被上游限制（11140 request illegal）：上游判定账号存在异常行为并已停用。\
+         这是账号级限制，换模型、换网关 Key 都不会解除，需重新登录该上游账号；\
+         网关已把它移出可用池，避免继续重试加重风控。"
+    )
 }
 
 /// 申请在途额度；占满时**轮询等待**至多 `timeout_ms`，超时才返回 `None`。
@@ -2524,8 +2562,39 @@ mod tests {
             should_rotate(&UpstreamEvent::AuthRejected, 5),
             "401/403 不受 attempt 预算影响（它换号就能救）"
         );
+        // 11140（账号被上游限制）同理：这个号废了，但别的号可能完好。
+        assert!(should_rotate(&UpstreamEvent::AccountRestricted, 0));
         // 对照：参数错（400/422）仍然不换号 —— 换号只是把同一份坏参数喂给下一个号。
         assert!(!should_rotate(&UpstreamEvent::Client, 0));
+    }
+
+    /// 11140 的对外消息**不得**再是上游原文（用户只看到 `API Error: 400 {"code":11140,...}`，
+    /// 无法判断下一步）。其它失败必须保留原文（参数错要靠它自查）。
+    #[test]
+    fn account_restricted_message_is_actionable_but_other_errors_keep_raw_body() {
+        let restricted = client_facing_message(
+            &UpstreamEvent::AccountRestricted,
+            "someone@example.com",
+            r#"{"code":11140,"msg":"request illegal"}"#,
+        );
+        assert!(restricted.contains("someone@example.com"));
+        assert!(restricted.contains("11140"));
+        assert!(restricted.contains("重新登录"));
+        assert!(
+            !restricted.contains("requestId"),
+            "不要把上游 JSON 原样塞给人看"
+        );
+        assert!(
+            !restricted.contains("**"),
+            "客户端不会渲染 Markdown，星号会原样显示"
+        );
+
+        let raw = r#"{"code":400,"msg":"messages: field required"}"#;
+        assert_eq!(
+            client_facing_message(&UpstreamEvent::Client, "a", raw),
+            raw,
+            "参数错必须保留原文"
+        );
     }
 }
 

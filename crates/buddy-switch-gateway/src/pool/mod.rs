@@ -466,6 +466,19 @@ pub enum UpstreamEvent {
     /// ⇒ 本档只做**短冷却 + 换号**，让保活刷新后自然恢复；真正被作废的会话
     /// 会带 `12153`，那条路仍然走三振禁用。
     AuthRejected,
+    /// **账号被上游限制**（WorkBuddy `11140 request illegal`）。
+    ///
+    /// ## 为什么不并进 [`Self::AuthRejected`]
+    ///
+    /// 401/403 是「这一次凭据被拒」，保活刷新可能自愈，所以只冷 60 秒；而 `11140`
+    /// 是上游对该账号的**硬处置**——参考实现的错误码表写明「到期也不自愈，必须重新登录」。
+    /// 两者混用会让这个号每 60 秒被重新选中一次，持续撞同一堵墙：
+    /// 实测一个 130 积分、从未成功过的账号因此在一天内累计 1000+ 次失败，
+    /// 而它仍因为「积分权重最高」被反复选走。反复撞墙本身还会加重上游的风控判断。
+    ///
+    /// ⇒ 本档**直接禁用该账号**（终态，人工「恢复」或重新登录后由用户解除），
+    /// 但**不终止本轮换号**：别的账号可能完好，当前请求应继续试下去。
+    AccountRestricted,
     /// 其它 4xx → 仅记错，不做治理动作。
     Client,
 }
@@ -633,6 +646,17 @@ const MODEL_RATE_MARKERS: &[&str] = &["IsModelRateLimit", "6004"];
 /// 模型封禁标记（`11102`）。
 const MODEL_BLOCK_MARKER: &str = "11102";
 
+/// 账号被上游限制标记（`11140 request illegal`）。
+///
+/// ⚠️ 上游常把它包在 **403** 里返回（正文 `{"code":11140,...}`）。只看状态码会落进
+/// [`UpstreamEvent::AuthRejected`]（60 秒浅冷却、到期再撞），与「必须重新登录」的
+/// 真实语义正好相反。因此判定**必须读正文**，且排在状态码分支之前。
+const ACCOUNT_RESTRICTED_MARKER: &str = "11140";
+
+/// 账号被限制时写入池的禁用原因（UI 与日志共用同一句）。
+pub const ACCOUNT_RESTRICTED_REASON: &str =
+    "上游账号被限制（11140 request illegal），需重新登录该账号";
+
 /// 从响应体里尝试解析上游声明的重置时刻。
 ///
 /// 两条分支，**结构化优先**：
@@ -762,6 +786,11 @@ pub fn classify_event(status: u16, body: &str) -> UpstreamEvent {
         .any(|marker| body.contains(marker))
     {
         return UpstreamEvent::SessionDead;
+    }
+    // 账号被限制（11140）同样藏在 400/403 里，且**不能**当凭据问题浅冷却：
+    // 上游对该账号的处置不会自愈，必须重新登录（见 `UpstreamEvent::AccountRestricted`）。
+    if body.contains(ACCOUNT_RESTRICTED_MARKER) {
+        return UpstreamEvent::AccountRestricted;
     }
     // 模型封禁先于 429 判定：封禁可能以 400/403 返回，把它归到限流分支会走错退避公式。
     if body.contains(MODEL_BLOCK_MARKER) {
@@ -1743,6 +1772,13 @@ impl Pool {
                 );
                 false
             }
+            UpstreamEvent::AccountRestricted => {
+                // 上游硬处置：**禁用**（终态），不再每 60 秒重撞一次。
+                // 返回 `false` 是刻意的：这里的返回值语义是「是否终止本轮换号」，
+                // 而别的账号可能完好 —— 当前请求应该继续试，不该陪葬。
+                entry.disable(ACCOUNT_RESTRICTED_REASON);
+                false
+            }
             UpstreamEvent::Client => false,
         }
     }
@@ -2625,6 +2661,15 @@ mod tests {
             classify_event(403, "forbidden"),
             UpstreamEvent::AuthRejected
         );
+        // ★ 11140（账号被上游限制）必须**先于** 403 判定：上游把它包在 403 里，
+        //   若按状态码落 AuthRejected，就只会冷 60 秒然后继续撞同一堵墙。
+        assert_eq!(
+            classify_event(
+                403,
+                r#"{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted"}}"#
+            ),
+            UpstreamEvent::AccountRestricted
+        );
         // 带 12153 标记的 401 仍走**会话失效**（三振禁用）—— 标记优先于状态码，
         // 因为「会话被作废」与「token 过期」的处置不同（前者刷新救不回来）。
         assert_eq!(
@@ -2775,6 +2820,35 @@ mod tests {
             0,
             "冷却到期后必须恢复可用"
         );
+    }
+
+    /// ★ 11140：**一次性禁用**该账号，但**不终止本轮换号**。
+    ///
+    /// 两条断言各自钉住一个反事实：
+    /// - 不置 `disabled` ⇒ 这个号会在 60 秒后重新被选中，继续撞墙（实测 1000+ 次失败）；
+    /// - 返回值若为 `true` ⇒ 当前请求直接失败，池里其它健康号被连坐。
+    #[test]
+    fn account_restricted_disables_account_but_keeps_rotating() {
+        let mut pool = Pool::new(PoolConfig::default());
+        pool.upsert("bad", Some(RealmTag::Cn), "被限制");
+        pool.upsert("good", Some(RealmTag::Cn), "正常");
+
+        let stop = pool.apply_upstream_error("bad", "m", &UpstreamEvent::AccountRestricted, NOW);
+
+        assert!(!stop, "被限制的号不该让本轮请求直接失败");
+        let entry = pool.get("bad").expect("账号在池里");
+        assert!(entry.disabled, "11140 是终态：必须禁用，不能只浅冷却");
+        assert_eq!(entry.reason, ACCOUNT_RESTRICTED_REASON);
+        assert!(
+            entry.cool_remaining_ms(NOW) == 0,
+            "禁用不需要额外的冷却计时"
+        );
+        assert!(!pool.get("good").unwrap().disabled, "别的账号不得被连坐");
+
+        // 禁用后不再可路由：重复失败也不该改变结论。
+        let again = pool.apply_upstream_error("bad", "m", &UpstreamEvent::AccountRestricted, NOW);
+        assert!(!again);
+        assert!(pool.get("bad").unwrap().disabled);
     }
 
     #[test]

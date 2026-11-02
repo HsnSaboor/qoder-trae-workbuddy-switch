@@ -178,6 +178,9 @@ pub fn probe_state_of(event: &UpstreamEvent) -> ProbeState {
         // 旧映射把它并进 `upstream_error`，于是一个「凭据过期」的号在探测结论里
         // 与「上游抖动」同档，看的人没法判断该去重新登录还是等一等。
         UpstreamEvent::AuthRejected => ProbeState::AuthDead,
+        // 11140：上游已停用该账号，下一步同样是「重新登录」。归到 `auth_dead` 才能让
+        // 探测结论与池里的禁用原因一致（否则卡片会一边写禁用、一边报「上游抖动」）。
+        UpstreamEvent::AccountRestricted => ProbeState::AuthDead,
         UpstreamEvent::NotFound => ProbeState::ModelUnavailable,
         // 超时与 5xx 在**探测结论**里同档（都是「上游这次没给结果」），
         // 但降级判据里分开（见 `UpstreamEvent::Timeout`）。
@@ -1827,6 +1830,12 @@ mod tests {
         assert_eq!(
             probe_state_of(&UpstreamEvent::Client),
             ProbeState::UpstreamError
+        );
+        // 11140：上游已停用该账号，下一步是「重新登录」——与凭据死同档，
+        // 不能报成「上游抖动」（那会让用户一直等它自愈）。
+        assert_eq!(
+            probe_state_of(&UpstreamEvent::AccountRestricted),
+            ProbeState::AuthDead
         );
     }
 
