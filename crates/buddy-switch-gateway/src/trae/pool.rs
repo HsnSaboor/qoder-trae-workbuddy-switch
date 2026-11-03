@@ -92,8 +92,11 @@ pub fn client_error_of(code: i64, message: &str) -> crate::failover::ClientError
         // 额度/限流/会话失效/凭据被拒 ⇒ 统一 429：对客户端都是「这个号不行了，换一个」。
         // ★ `SessionDead` 也走 429 而不是 401 —— 见 issue #129 §5.2 改动 2。
         TraeErrKind::PlanLimit
-        | TraeErrKind::SoftRate
-        | TraeErrKind::SessionDead
+        | TraeErrKind::SoftRate => UpstreamEvent::SoftRate {
+            reset_at_ms: None,
+            model_scoped: true,
+        },
+        TraeErrKind::SessionDead
         | TraeErrKind::AuthRejected
         // 未知业务码：换号也可能救（`should_rotate` 对它为真），给可重试更安全。
         | TraeErrKind::Business => UpstreamEvent::SoftRate {
