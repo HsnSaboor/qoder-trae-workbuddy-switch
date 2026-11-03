@@ -173,18 +173,22 @@ pub fn classify_solo(code: i64, message: &str) -> TraeErrKind {
         return TraeErrKind::SessionDead;
     }
     let lower = message.to_lowercase();
-    if code == 1005 || lower.contains("plan") || lower.contains("exceeded the quota") {
-        return TraeErrKind::PlanLimit;
-    }
     // 模型配置为空是**模型**问题而非账号问题，冷却账号没有意义。
     if code == 4001 || lower.contains("model config is empty") {
         return TraeErrKind::None;
     }
+    // ★ 4008 是限流（SoftRate 60s），包含 "Your requests have exceeded the quota."。
+    // 必须在 PlanLimit 判定之前处理，否则会被 "exceeded the quota" 误判为硬性的 PlanLimit（12小时锁定且不参与兜底）。
     if code == 4008
-        || lower.contains("quota")
-        || lower.contains("exceeded")
         || lower.contains("rate")
+        || lower.contains("exceeded the quota")
     {
+        return TraeErrKind::SoftRate;
+    }
+    if code == 1005 || lower.contains("plan") {
+        return TraeErrKind::PlanLimit;
+    }
+    if lower.contains("quota") || lower.contains("exceeded") {
         return TraeErrKind::SoftRate;
     }
     match code {
@@ -1143,6 +1147,10 @@ mod tests {
         assert_eq!(classify_solo(0, "model config is empty"), TraeErrKind::None);
         // 4008 是限流，短冷却。
         assert_eq!(classify_solo(4008, ""), TraeErrKind::SoftRate);
+        assert_eq!(
+            classify_solo(4008, "Your requests have exceeded the quota."),
+            TraeErrKind::SoftRate
+        );
         assert_eq!(classify_solo(0, "Quota exceeded"), TraeErrKind::SoftRate);
         assert_eq!(classify_solo(0, "rate limit"), TraeErrKind::SoftRate);
         // 裸 401 走浅冷却档；带作废标记才是永久档（issue #108）。
